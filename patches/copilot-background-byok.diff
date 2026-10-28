@@ -80,32 +80,6 @@ Index: code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.t
  }
  
  /**
-Index: code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts
-===================================================================
---- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts
-+++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts
-@@ -71,9 +71,8 @@ configurationRegistry.registerConfigurat
- 		'chat.editor.preferCopilotHarness': {
- 			type: 'boolean',
- 			description: nls.localize('chat.editor.preferCopilotHarness', "When enabled, uses the Agent Host Copilot SDK whenever the local harness would otherwise be selected for a new editor chat session. Claude and Codex selections are unaffected."),
--			default: false,
-+			default: true,
- 			tags: ['experimental'],
--			experiment: { mode: 'startup' },
- 			policy: {
- 				name: 'ChatEditorPreferCopilotHarness',
- 				category: PolicyCategory.InteractiveSession,
-@@ -89,9 +88,8 @@ configurationRegistry.registerConfigurat
- 		'chat.defaultToCopilotHarness': {
- 			type: 'boolean',
- 			description: nls.localize('chat.defaultToCopilotHarness', "When enabled, new editor and panel chat sessions default to the Agent Host Copilot SDK instead of the local harness."),
--			default: false,
-+			default: true,
- 			tags: ['experimental'],
--			experiment: { mode: 'startup' },
- 		},
- 		'chat.editor.localAgent.enabled': {
- 			type: 'boolean',
 Index: code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
@@ -948,7 +922,7 @@ Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSession
  import { registerWorkbenchContribution2, IWorkbenchContribution, WorkbenchPhase } from '../../../../../common/contributions.js';
  import { AgentHostAllowSignedOutWhenUsableContribution } from './agentHostAllowSignedOutWhenUsableContribution.js';
  import { AgentHostByokLmHandler } from './agentHostByokLmHandler.js';
-@@ -37,9 +39,40 @@ import './agentHostSettings.contribution
+@@ -37,9 +39,44 @@ import './agentHostSettings.contribution
  import './agentSessionSettings.contribution.js';
  
  /**
@@ -988,10 +962,14 @@ Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSession
 +	}
 +}
 +
++/**
++ * Freezes the legacy-migration setting at startup so enabling it only takes effect
++ * on the next window reload. Runs before any session can be opened (BlockStartup).
++ */
  class AgentHostLegacyMigrationGateContribution extends Disposable implements IWorkbenchContribution {
  	static readonly ID = 'workbench.contrib.chat.agentHostLegacyMigrationGate';
  	constructor(@IConfigurationService configurationService: IConfigurationService) {
-@@ -49,6 +82,7 @@ class AgentHostLegacyMigrationGateContri
+@@ -49,6 +86,7 @@ class AgentHostLegacyMigrationGateContri
  }
  
  registerWorkbenchContribution2(AgentHostContribution.ID, AgentHostContribution, WorkbenchPhase.AfterRestored);
