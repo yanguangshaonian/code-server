@@ -1,0 +1,69 @@
+code-server 自用维护分支
+
+维护分支: byok/server-owned
+官方基线: v4.143.1, 22ddf60dbc52f164cff13620ab515086dd08c90a
+VS Code: 1.143.1, e646868227c3e3a9e3f24277c8c7220be42c0be7
+PR: https://github.com/coder/code-server/pull/8047
+固定来源: 73f71d62f4b26c04dd50b595a3837231a1b5b6aa
+
+本分支直接从官方基线创建, 不继承此前自定义分支的提交.
+保留官方 VS Code gitlink, 自定义代码由 patches/series 中末尾两个补丁承载:
+- copilot-background-byok.diff: 服务器内存持有 BYOK direct provider 配置.
+- copilot-agenthost-session-changes.diff: PR 自带的 Changes 选择修正.
+保留 PR 对 Copilot harness 默认值的调整. 不包含 Sessions Web.
+
+原 PR 面向 VS Code 1.141. 本次仅处理 1.143.1 的版本冲突:
+导入位置和接口上下文, dispatchAction 的 credentials 参数及 Promise 返回类型,
+BYOK 设置默认值和 Ambient 同步作用域, workingSet 优先于 worktree 默认值,
+以及对应测试适配. 恢复插入 contribution 时覆盖的官方说明注释.
+移植复用了此前已验证的冲突解决结果, 未引入额外执行器或运行时兼容层.
+
+执行边界:
+Copilot SDK 通过服务器直连可转换的 BYOK 模型. Local 执行路径未改写.
+凭据同步消息在 AHP JSONL 日志中脱敏, 快照只保存在 Agent Host 内存.
+浏览器断连后快照仍在, Agent Host 重启后需客户端重新同步.
+thinking: true, 特殊请求头等无法直接表达的配置仍会被 direct 转换排除.
+远程链路没有完整 renderer 推理回退, 此类模型可能不会显示.
+推理强度和模型质量不等价, 不能通过删除 thinking 字段保证效果不变.
+真实 BYOK 在全部浏览器关闭后的多轮任务持续执行仍需端到端验证.
+
+首次准备与构建:
+按照 docs/CONTRIBUTING.md 安装项目要求的 Node 和依赖.
+git submodule update --init --recursive
+quilt push -a --fuzz=0
+安装依赖后使用官方 build, build:vscode, release, package 脚本.
+例如 VERSION=4.143.1 npm run build:vscode, 其余环境按 ci/build 脚本准备.
+不能跳过构建时的 quality=stable 和 BUILD_SOURCEVERSION 准备.
+发布必须使用同一次构建的配套前后端与依赖, 不用官方 deb 底座覆盖独立 bundle.
+验证前后端 commit/quality 一致, 主题 JSON, 扩展字体与图标资源返回 200.
+旧 tag 对应的 148 MiB 混合 deb 已知存在资源路径故障, 不应继续使用.
+旧二进制文件不代表本分支的新构建产物.
+
+跟随官方升级:
+1. 确认工作区无未保存修改, 保存当前可工作的提交并新建升级分支.
+2. quilt pop -a, 将 VS Code 工作目录恢复至当前官方 gitlink 对应源码.
+3. git fetch origin --tags, 将目标官方 release tag merge 到升级分支.
+4. 保留目标官方版本的 lib/vscode gitlink, git submodule update --init.
+5. quilt push -a --fuzz=0, 逐个处理失败补丁. 必要时 quilt push -f 后,
+   依据目标版本接口修复拒绝块, 删除 .rej, quilt refresh, 再应用下一补丁.
+6. 优先使用新官方实现, 已由官方实现的补丁应删除, 不保留重复兼容路径.
+7. 检查定向类型与测试, pop/push 零 fuzz 重放全部补丁, 再完整构建发布包.
+8. 验证 BYOK 注册, 凭据日志脱敏, 真实请求, 主题字体与浏览器断连重连.
+9. 将升级合入 byok/server-owned 并为验证通过的源码打新 tag.
+
+核心回归入口:
+node lib/vscode/build/next/index.ts build-fast --client-only
+node lib/vscode/test/unit/node/index.js --runGlob '**/platform/agentHost/test/{node/byokLmBridgeRegistry,node/copilotSessionLauncher,node/protocolServerHandler,common/ahpJsonlLogger}.test.js'
+浏览器测试覆盖 AgentHostByokLmHandler 和 AgentHostSessionInputPills.
+跨模块接口调整后运行 npm --prefix lib/vscode run typecheck-client.
+
+2026-10-29 本次移植验证:
+- build-fast --client-only 重新生成测试产物成功.
+- 客户端 typecheck-client 通过, 580 项定向 Node 测试通过.
+- 99 项 Chromium 测试通过. 官方测试 fixture 缺少 code-server 要求的
+    userDataPath, 测试时仅临时修改生成 JS 补齐目录, 验证后已撤销.
+- 全部 31 个补丁 pop/push 零 fuzz 重放通过, 官方子模块 gitlink 未改动.
+- 本次未重新生成发布包, 未部署或重启生产服务.
+
+旧自定义 tag 保留用于追溯. 旧 cleanup/byok-background 开发分支删除,
+后续开发以 byok/server-owned 为准. 不因本次源码重建自动部署生产服务.
