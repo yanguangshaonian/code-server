@@ -58,8 +58,14 @@ export VSCODE_REMOTE_CXXFLAGS='' VSCODE_REMOTE_LDFLAGS=''
 代理环境后, 在同一隔离目录重试依赖, 继续执行脚本的剩余步骤并成功.
 不是一次无干预构建; 未更改依赖源码, 未跳过编译与类型检查.
 该次产物在目标筛选改动之前生成, 当时 core-ci 仍编译了三个 bundle 目标.
-后续统一入口已限定 server-web; 已验证任务选择与补丁重放,
-尚未为该目标筛选改动重新执行完整发布构建.
+后续统一入口已限定 server-web; 已验证任务选择与补丁重放.
+提交 944a496 已通过统一入口完成一次无中途重试的完整构建,
+使用上述 Clang 和代理环境. 日志确认 bundle 目标只有 server-web.
+构建目录: /tmp/vscode/build-944a496-Iq0O2v
+deb: /tmp/vscode/build-944a496-Iq0O2v/source/release-packages/code-server_4.143.1-byok-944a496_amd64.deb
+大小约 223 MiB, 架构 amd64. 三种产物 SHA256 校验通过.
+最终 deb 解包启动后, 编辑器, 前端 bundle 和远端 Seti 主题均返回 200,
+前后端 commit/quality 一致, 无页面异常. 记录位于 logs/runtime-check.json.
 构建目录: /tmp/vscode/build-4c02260-lsK7EA
 deb: /tmp/vscode/build-4c02260-lsK7EA/source/release-packages/code-server_4.143.1-byok-4c02260_amd64.deb
 大小约 223 MiB. 另有 rpm, tar.gz 和 SHA256SUMS, 三种产物校验均通过.
