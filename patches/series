@@ -29,3 +29,4 @@ remote-secret-storage.diff
 csp-hashes.diff
 copilot-background-byok.diff
 copilot-agenthost-session-changes.diff
+server-web-build.diff

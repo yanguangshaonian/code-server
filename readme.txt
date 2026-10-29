@@ -7,9 +7,10 @@ PR: https://github.com/coder/code-server/pull/8047
 固定来源: 73f71d62f4b26c04dd50b595a3837231a1b5b6aa
 
 本分支直接从官方基线创建, 不继承此前自定义分支的提交.
-保留官方 VS Code gitlink, 自定义代码由 patches/series 中末尾两个补丁承载:
+保留官方 VS Code gitlink, 自定义代码由 patches/series 中末尾三个补丁承载:
 - copilot-background-byok.diff: 服务器内存持有 BYOK direct provider 配置.
 - copilot-agenthost-session-changes.diff: PR 自带的 Changes 选择修正.
+- server-web-build.diff: 允许 core-ci 仅生成 server-web bundle.
 保留 PR 对 Copilot harness 默认值的调整. 不包含 Sessions Web.
 
 原 PR 面向 VS Code 1.141. 本次仅处理 1.143.1 的版本冲突:
@@ -36,9 +37,37 @@ thinking: true, 特殊请求头等无法直接表达的配置仍会被 direct �
 中间文件, npm 缓存和临时文件也放在该目录, 不向原项目写入构建产物.
 脚本不安装系统包, 不部署服务, 不复用已有工作区的 node_modules.
 网络代理和原生编译工具按宿主机环境准备. 失败时保留目录及分阶段日志.
-该入口调用完整官方 build:vscode 流程, 最终生成 server-web release,
+当前宿主机默认 Node 已升级为 24.22.1, npm 为 11.19.1.
+Electron 43.7.7 头文件不能由此机 GCC 11 正确编译; 已验证宿主机
+clang-20/clang++-20 配合 GCC 11 标准库可正常编译链接. 本机使用:
+export CC=clang-20 CXX=clang++-20
+export CXXFLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11
+export LDFLAGS=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11
+export VSCODE_REMOTE_CC=gcc VSCODE_REMOTE_CXX=g++
+export VSCODE_REMOTE_CXXFLAGS='' VSCODE_REMOTE_LDFLAGS=''
+这些是本机工具链设置, 不是通用路径, 不应硬编码到依赖源码.
+代理通过 HTTP_PROXY/HTTPS_PROXY 和 NODE_USE_ENV_PROXY=1 传入,
+同时设置 NO_PROXY=localhost,127.0.0.1. 如 GitHub API 代理出口返回 403,
+应先验证直连, 确认可用后再将 api.github.com 加入 NO_PROXY.
+该入口固定 VSCODE_BUILD_TARGET=server-web 和 VSCODE_TARGET=linux-x64,
+仅构建 Linux x86_64 的 server-web bundle, 不构建 desktop 或纯 server bundle.
+保留官方必要的扩展编译, 核心类型检查和源码转译, 最终生成 server-web release,
 并检查发布 product.json 与前端 bundle 的 commit/quality 一致性.
-本次已验证脚本语法和预检, 尚未通过该入口执行完整发布构建.
+2026-10-29 已完成提交 4c02260 的完整源码发布构建.
+首次入口在依赖安装中遇到工具链及网络问题; 使用上述宿主机编译参数和
+代理环境后, 在同一隔离目录重试依赖, 继续执行脚本的剩余步骤并成功.
+不是一次无干预构建; 未更改依赖源码, 未跳过编译与类型检查.
+该次产物在目标筛选改动之前生成, 当时 core-ci 仍编译了三个 bundle 目标.
+后续统一入口已限定 server-web; 已验证任务选择与补丁重放,
+尚未为该目标筛选改动重新执行完整发布构建.
+构建目录: /tmp/vscode/build-4c02260-lsK7EA
+deb: /tmp/vscode/build-4c02260-lsK7EA/source/release-packages/code-server_4.143.1-byok-4c02260_amd64.deb
+大小约 223 MiB. 另有 rpm, tar.gz 和 SHA256SUMS, 三种产物校验均通过.
+Debian 内部版本为 4.143.1~byok-4c02260, 排序低于官方正式版 4.143.1.
+最终 deb 解包启动验证: 编辑器 HTTP 200, 前端 bundle HTTP 200,
+远端 Seti 图标主题资源 HTTP 200, 前后端 commit/quality 一致, 无页面异常.
+验证记录位于 logs/runtime-check.json. 未安装或重启生产服务,
+真实 BYOK 与全部浏览器关闭后的持续执行未在本次发布包上验证.
 
 按照 docs/CONTRIBUTING.md 安装项目要求的 Node 和依赖.
 git submodule update --init --recursive

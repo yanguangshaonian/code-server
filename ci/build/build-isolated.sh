@@ -37,6 +37,7 @@ export PLAYWRIGHT_BROWSERS_PATH="$build_root/playwright"
 export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}"
 export VERSION="$version" RELEASE_PATH=release KEEP_MODULES=1 MINIFY=true CI=1
 export VSCODE_TARGET=linux-x64 ARCH=amd64
+export VSCODE_BUILD_TARGET=server-web
 mkdir -p "$TMPDIR" "$npm_config_cache" "$XDG_CACHE_HOME" "$build_root/logs"
 trap 'printf "构建失败或中断, 日志和中间产物保留在: %s\n" "$build_root" >&2' ERR
 
