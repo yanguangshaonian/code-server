@@ -112,5 +112,16 @@ node lib/vscode/test/unit/node/index.js --runGlob '**/platform/agentHost/test/{n
 - 全部 31 个补丁 pop/push 零 fuzz 重放通过, 官方子模块 gitlink 未改动.
 - 本次未重新生成发布包, 未部署或重启生产服务.
 
+2026-10-29 仓库恢复后的 Copilot 上下文修复:
+- remote-chat-attachments.diff: 普通和待发送消息的资源附件转换为当前远端真实 URI,
+    保留其他主机地址, 附件元数据和未保存内容快照.
+- copilot-editor-context.diff: 传递当前源文件路径, 为未保存内容保留源文件身份;
+    首次提交按手选目录, 活动文件所属项目, 文件树目录和默认目录选择工作目录.
+    自动推荐不冒充手选, 正式会话固定初始目录, 销毁时清理锁定状态.
+- 客户端 typecheck-client 通过, build-fast --client-only 通过,
+    三个相关测试文件的 764 项 Chromium 测试通过.
+- 两个补丁已完成零 fuzz 撤销重放. 本轮未生成新发布包,
+    未部署或重启 Cloud Studio, 真实模型端到端行为尚待验证.
+
 旧自定义 tag 保留用于追溯. 旧 cleanup/byok-background 开发分支删除,
 后续开发以 byok/server-owned 为准. 不因本次源码重建自动部署生产服务.

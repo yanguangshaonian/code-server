@@ -1,0 +1,68 @@
+Index: code-server/lib/vscode/src/vs/workbench/services/agentHost/common/editorRemoteAgentHostTransport.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/services/agentHost/common/editorRemoteAgentHostTransport.ts
++++ code-server/lib/vscode/src/vs/workbench/services/agentHost/common/editorRemoteAgentHostTransport.ts
+@@ -11,7 +11,7 @@ import { hasKey } from '../../../../base
+ import { URI } from '../../../../base/common/uri.js';
+ import { createURITransformer } from '../../../../base/common/uriTransformer.js';
+ import { ActionType, type StateAction } from '../../../../platform/agentHost/common/state/protocol/actions.js';
+-import { CustomizationEnablementKind, CustomizationType, type ChildCustomization, type ClientPluginCustomization, type Customization, type CustomizationEnablement, type SessionActiveClient, type Snapshot } from '../../../../platform/agentHost/common/state/protocol/state.js';
++import { CustomizationEnablementKind, CustomizationType, MessageAttachmentKind, type ChildCustomization, type ClientPluginCustomization, type Customization, type CustomizationEnablement, type SessionActiveClient, type Snapshot } from '../../../../platform/agentHost/common/state/protocol/state.js';
+ import { isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResponse, ReconnectResultType, type CommandMap, type ProtocolMessage } from '../../../../platform/agentHost/common/state/sessionProtocol.js';
+ import { readSessionFolderPickerDecision, withSessionFolderPickerDecision } from '../../../../platform/agentHost/common/state/sessionState.js';
+ import type { IClientTransport } from '../../../../platform/agentHost/common/state/sessionTransport.js';
+@@ -94,7 +94,21 @@ export class EditorRemoteAgentHostTransp
+ 					break;
+ 			}
+ 		} else if (isJsonRpcNotification(message) && message.method === 'dispatchAction') {
+-			message = { ...message, params: { ...message.params, action: this._mapAction(message.params.action, value => this._toHostDirectory(value)) } };
++			let action = this._mapAction(message.params.action, value => this._toHostDirectory(value));
++			if (action.type === ActionType.ChatTurnStarted || action.type === ActionType.ChatPendingMessageSet) {
++				action = {
++					...action,
++					message: {
++						...action.message,
++						...(action.message.attachments ? {
++							attachments: action.message.attachments.map(attachment => attachment.type === MessageAttachmentKind.Resource
++								? { ...attachment, uri: this._toHostDirectory(attachment.uri) }
++								: attachment),
++						} : {}),
++					},
++				};
++			}
++			message = { ...message, params: { ...message.params, action } };
+ 		}
+ 		this._transport.send(message);
+ 	}
+Index: code-server/lib/vscode/src/vs/workbench/services/agentHost/test/common/editorRemoteAgentHostTransport.test.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/services/agentHost/test/common/editorRemoteAgentHostTransport.test.ts
++++ code-server/lib/vscode/src/vs/workbench/services/agentHost/test/common/editorRemoteAgentHostTransport.test.ts
+@@ -156,6 +156,27 @@ suite('EditorRemoteAgentHostTransport',
+ 		return { underlying, transport, received };
+ 	}
+ 
++	test('maps outgoing file attachments without changing snapshot data or source messages', () => {
++		const { underlying, transport } = createTransport();
++		const attachments = [
++			{ type: 'resource', uri: remoteDirectory, label: 'design.txt', _meta: { keep: true } },
++			{ type: 'resource', uri: otherRemoteDirectory, label: 'design.txt' },
++			{ type: 'embeddedResource', data: 'YQ==', contentType: 'text/plain' },
++		];
++		for (const type of [ActionType.ChatTurnStarted, ActionType.ChatPendingMessageSet]) {
++			const message = {
++				jsonrpc: '2.0', method: 'dispatchAction',
++				params: { channel: chat, clientSeq: 1, action: { type, turnId: 'turn', startedAt: timestamp, id: 'pending', kind: 'queued', message: { text: opaqueText, kind: MessageKind.User, attachments } } },
++			} as ProtocolMessage;
++			const original = JSON.stringify(message);
++			transport.send(message);
++			const expected = JSON.parse(original);
++			expected.params.action.message.attachments[0].uri = fileDirectory;
++			assert.deepStrictEqual(underlying.messages.at(-1), expected);
++			assert.strictEqual(JSON.stringify(message), original);
++		}
++	});
++
+ 	test('round-trips directory actions when the remote authority contains uppercase characters', () => {
+ 		const { underlying, transport, received } = createTransport('wsl+Ubuntu');
+ 		underlying.messageEmitter.fire({
