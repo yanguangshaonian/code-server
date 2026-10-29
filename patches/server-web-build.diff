@@ -1,0 +1,17 @@
+Index: code-server/lib/vscode/build/gulpfile.vscode.ts
+===================================================================
+--- code-server.orig/lib/vscode/build/gulpfile.vscode.ts
++++ code-server/lib/vscode/build/gulpfile.vscode.ts
+@@ -84,8 +84,10 @@ task.task(task.define('core-ci', task.se
+ 	coreCIOutBuildTask,
+ 	// Then bundle for shipping (bundles also write NLS files to out-build)
+ 	task.parallel(
+-		task.define('esbuild-vscode-min', () => runEsbuildBundle('out-vscode-min', true, true, 'desktop', `${sourceMappingURLBase}/core`)),
+-		task.define('esbuild-vscode-reh-min', () => runEsbuildBundle('out-vscode-reh-min', true, true, 'server', `${sourceMappingURLBase}/core`)),
++		...(process.env['VSCODE_BUILD_TARGET'] === 'server-web' ? [] : [
++			task.define('esbuild-vscode-min', () => runEsbuildBundle('out-vscode-min', true, true, 'desktop', `${sourceMappingURLBase}/core`)),
++			task.define('esbuild-vscode-reh-min', () => runEsbuildBundle('out-vscode-reh-min', true, true, 'server', `${sourceMappingURLBase}/core`)),
++		]),
+ 		task.define('esbuild-vscode-reh-web-min', () => runEsbuildBundle('out-vscode-reh-web-min', true, true, 'server-web', `${sourceMappingURLBase}/core`)),
+ 	)
+ )));

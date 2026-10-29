@@ -1,0 +1,255 @@
+Index: code-server/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts
+@@ -9,6 +9,8 @@ import { supportsSandboxCertificateInsta
+ import { InstallSandboxCertificateExtensionMethod, RemoveSandboxCertificateExtensionMethod, RotateSandboxCertificateExtensionMethod } from '../common/sandboxCertificateProtocol.js';
+ import { DeferredPromise, disposableTimeout, IntervalTimer, raceCancellationError, TimeoutTimer } from '../../../base/common/async.js';
+ import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
++import type { IByokLmModelInfo } from '../common/agentHostByokLm.js';
++import { AgentHostClientByokLmChannel } from '../common/agentHostClientByokLmChannel.js';
+ import { CancellationError, getErrorMessage } from '../../../base/common/errors.js';
+ import { Emitter, Event } from '../../../base/common/event.js';
+ import { Disposable, DisposableMap, DisposableStore, MutableDisposable, IReference, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
+@@ -525,6 +527,21 @@ export class AgentHostProtocolClient ext
+ 	private readonly _resolveAdvertisedAuthentication: IAgentHostProtocolClientOptions['resolveAdvertisedAuthentication'];
+ 	private readonly _onDispose: (() => void) | undefined;
+ 	private _didDispose = false;
++	private _byokChannel: AgentHostClientByokLmChannel | undefined;
++
++	serveRemoteByok(channel: AgentHostClientByokLmChannel): void {
++		this._byokChannel = channel;
++		let models: IByokLmModelInfo[] = [];
++		const publish = () => {
++			if (this.connectionState === AgentHostClientState.Connected) {
++				const enabled = this._configurationService.getValue<boolean>('chat.agentHost.byokModels.enabled');
++				void this.sendHostExtensionRequest('extensions/byok/models', enabled ? models : []).catch(error => this._logService.warn('同步远程 BYOK 模型失败.', error));
++			}
++		};
++		this._register(channel.listen<IByokLmModelInfo[]>(undefined, 'models')(snapshot => { models = snapshot; publish(); }));
++		this._register(this.onDidChangeConnectionState(state => { if (state === AgentHostClientState.Connected) { publish(); } }));
++		this._register(this._configurationService.onDidChangeConfiguration(event => { if (event.affectsConfiguration('chat.agentHost.byokModels.enabled')) { publish(); } }));
++	}
+ 
+ 	/**
+ 	 * URIs we have already granted implicit read access for on this connection.
+@@ -3030,6 +3047,13 @@ export class AgentHostProtocolClient ext
+ 		void (async () => {
+ 			try {
+ 				switch (method) {
++					case 'extensions/byok/chat': {
++						if (!this._byokChannel || !this._configurationService.getValue<boolean>('chat.agentHost.byokModels.enabled')) {
++							throw new Error('当前客户端未开启 BYOK 模型服务.');
++						}
++						sendResult(await this._byokChannel.call(undefined, 'chat', params));
++						return;
++					}
+ 					case ClientArtifactIntegrationExtensionMethod: {
+ 						const server = this._servedArtifactIntegrations;
+ 						if (!server || !isArtifactIntegrationRequest(params)) {
+Index: code-server/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts
+@@ -50,6 +50,7 @@ import { AgentModelRefreshScheduler, MOD
+ import { AgentHostClaudeAgentEnabledEnvVar, AgentHostClaudeSdkRootEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostCodexAgentSdkRootEnvVar, isAgentEnabled } from '../common/agentService.js';
+ import { WebSocketProtocolServer } from './webSocketTransport.js';
+ import { ProtocolServerHandler } from './protocolServerHandler.js';
++import { ByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
+ import { AgentHostClientFileSystemProvider } from '../common/agentHostClientFileSystemProvider.js';
+ import { AGENT_CLIENT_SCHEME } from '../common/agentClientUri.js';
+ import { resolveServerUrls } from './serverUrls.js';
+@@ -192,6 +193,7 @@ async function main(): Promise<void> {
+ 		}
+ 	}
+ 
++	const byokLmBridgeRegistry = new ByokLmBridgeRegistry();
+ 	const runtime = await createAgentHostRuntime({
+ 		environmentService,
+ 		productService,
+@@ -201,7 +203,7 @@ async function main(): Promise<void> {
+ 		transientProxyConfiguration: false,
+ 		hostLaunchKind: AgentHostLaunchKind.VSCodeCLI,
+ 		providerConfigurations: [createCodexProviderConfiguration(environmentService.userHome, process.env[AgentHostCodexAgentCodexHomeEnvVar])],
+-		byok: { kind: 'unavailable' },
++		byok: { kind: 'renderer', bridgeRegistry: byokLmBridgeRegistry },
+ 	});
+ 	disposables.add(runtime);
+ 	const { agentService, instantiationService } = runtime;
+@@ -329,6 +331,7 @@ async function main(): Promise<void> {
+ 			completionTriggerCharacters: completions.triggerCharacters,
+ 			terminalCommandPrefix: BANG_COMMAND_PREFIX,
+ 			otlpLogEmitter,
++			byokLmBridgeRegistry,
+ 		},
+ 		clientFileSystemProvider,
+ 	));
+Index: code-server/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
+@@ -17,6 +17,9 @@ import { Schemas } from '../../../base/c
+ import { deepClone, equals, mixin } from '../../../base/common/objects.js';
+ import { encodeBase64 } from '../../../base/common/buffer.js';
+ import { Emitter, Event } from '../../../base/common/event.js';
++import { createAgentHostClientByokLmConnection } from '../common/agentHostClientByokLmChannel.js';
++import type { IByokLmModelInfo } from '../common/agentHostByokLm.js';
++import type { IByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
+ import { isJsonRpcResponse } from '../../../base/common/jsonRpcProtocol.js';
+ import { Disposable, DisposableMap, DisposableStore, MutableDisposable, toDisposable } from '../../../base/common/lifecycle.js';
+ import { StopWatch } from '../../../base/common/stopwatch.js';
+@@ -610,6 +613,7 @@ export interface IProtocolServerExtensio
+  * Configuration for protocol-level concerns outside of IAgentService.
+  */
+ export interface IProtocolServerConfig {
++	readonly byokLmBridgeRegistry?: IByokLmBridgeRegistry;
+ 	readonly scopedRelayCredentials?: boolean;
+ 	/** Trusted listener-owned delegation, applied only after validating the relay credential. */
+ 	readonly resolveRelayCredentials?: (principal: IAgentHostCredentialPrincipal, resource: string) => Promise<IAgentHostCredentialSource | undefined>;
+@@ -694,6 +698,7 @@ export class ProtocolServerHandler exten
+ 	private readonly _baselineDebt = new Map<string, Set<string>>();
+ 	private readonly _replayBuffer: ActionEnvelope[] = [];
+ 	private readonly _extensionEnvelopes = new WeakSet<ActionEnvelope>();
++	private readonly _byokModels = new WeakMap<IConnectedClient, Emitter<IByokLmModelInfo[]>>();
+ 	private readonly _relayRootConfigEnvelopes = new WeakMap<ActionEnvelope, ActionEnvelope>();
+ 	private readonly _telemetryReporter: AgentHostTelemetryReporter;
+ 	private readonly _managedSettingsOwnerId = generateUuid();
+@@ -2629,6 +2634,25 @@ export class ProtocolServerHandler exten
+ 		}
+ 
+ 		// VS Code extension methods (not in the typed protocol maps yet)
++		if (method === 'extensions/byok/models' && this._config.byokLmBridgeRegistry && client.transport.relayClientId === undefined) {
++			if (!Array.isArray(params) || params.length > 256 || !params.every(model => model && typeof model.vendor === 'string' && typeof model.id === 'string')) {
++				client.transport.send(jsonRpcError(id, JsonRpcErrorCodes.InvalidParams, 'BYOK 模型列表无效.'));
++				return;
++			}
++			let models = this._byokModels.get(client);
++			if (!models) {
++				models = client.initializationDisposables.add(new Emitter<IByokLmModelInfo[]>());
++				this._byokModels.set(client, models);
++				client.initializationDisposables.add(toDisposable(() => this._byokModels.delete(client)));
++				client.initializationDisposables.add(this._config.byokLmBridgeRegistry.register(`remote:${client.clientId}`, createAgentHostClientByokLmConnection({
++					listen: () => models!.event as Event<never>,
++					call: (_command, request) => this._sendReverseRequestToConnection(client, 'extensions/byok/chat', request),
++				})));
++			}
++			models.fire(params);
++			client.transport.send(jsonRpcSuccess(id, null));
++			return;
++		}
+ 		const artifactResult = method === ArtifactIntegrationExtensionMethod && client.artifactIntegrations
+ 			? isArtifactIntegrationRequest(params) ? client.artifactIntegrations.request(params) : Promise.reject(new ProtocolError(JsonRpcErrorCodes.InvalidParams, 'Invalid artifact integration request'))
+ 			: undefined;
+Index: code-server/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+@@ -6,6 +6,7 @@
+ import { AgentChatMoveRefusal, AgentChatMoveRefusedError, ChatMoveConfigKey, type AgentChatMoveDestination } from '../../common/agentHostChatMove.js';
+ import { ChatMoveDestinationKind } from '../../common/state/protocol/channels-chat/commands.js';
+ import assert from 'assert';
++import { ByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
+ import sinon from 'sinon';
+ import { generateKeyPairSync, sign, type JsonWebKey } from 'crypto';
+ import { EventEmitter } from 'events';
+@@ -658,6 +659,27 @@ suite('ProtocolServerHandler', () => {
+ 
+ 	ensureNoDisposablesAreLeakedInTestSuite();
+ 
++	test('remote BYOK registers models, completes inference and cleans up on disconnect', async () => {
++		handler.dispose();
++		const registry = new ByokLmBridgeRegistry();
++		disposables.add(new ProtocolServerHandler(
++			agentService, stateManager, server, { byokLmBridgeRegistry: registry }, fileSystemProvider,
++			logService, agentHostTelemetryService, managedSettingsService, clientConnections,
++			devContainerService, NullAgentHostOTelService, new TestHandlerChatOwnership(stateManager, agentService.chatOwners),
++		));
++		const transport = connectClient('remote-byok');
++		const models = [{ vendor: 'custom', id: 'model' }];
++		transport.simulateMessage(request(2, 'extensions/byok/models', models));
++		assert.deepStrictEqual(registry.getModels(), models);
++		const completion = registry.getServingConnection()!.chat({ vendor: 'custom', modelId: 'model', input: [] });
++		const reverse = findRequest(transport.sent, 'extensions/byok/chat');
++		assert.ok(reverse);
++		transport.simulateMessage({ jsonrpc: '2.0', id: reverse.id, result: { output: [], responseId: 'response' } });
++		assert.deepStrictEqual(await completion, { output: [], responseId: 'response' });
++		transport.simulateClose();
++		assert.strictEqual(registry.getServingConnection(), undefined);
++	});
++
+ 	test('handshake returns initialize response', () => {
+ 		const transport = connectClient('client-1');
+ 
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostRemoteByokNotification.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostRemoteByokNotification.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostRemoteByokNotification.ts
+@@ -121,7 +121,6 @@ export class AgentHostRemoteByokNotifica
+ 			return this._remoteAgentHostService.connections.some(connection =>
+ 				agentHostAuthority(connection.address) === authority && RemoteAgentHostConnectionStatus.isConnected(connection.status));
+ 		}
+-		// The otherwise-local Copilot harness runs remotely when the editor workspace has a live remote connection.
+-		return !!this._environmentService.remoteAuthority && this._remoteAgentService.getConnection()?.isConnected === true;
++		return false;
+ 	}
+ }
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostRemoteByokNotification.test.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostRemoteByokNotification.test.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostRemoteByokNotification.test.ts
+@@ -229,7 +229,7 @@ suite('AgentHostRemoteByokNotification',
+ 	});
+ 
+ 	for (const remoteAuthority of ['ssh-remote+host', 'wsl+Ubuntu', 'dev-container+container', 'codespaces+space']) {
+-		test(`waits for a connected ${remoteAuthority} workspace and hides on connection loss`, () => {
++		test(`does not warn for BYOK-enabled ${remoteAuthority} workspace connections`, () => {
+ 			const fixture = createFixture({ models: [createModel()], remoteAuthority, workspaceConnectionState: PersistentConnectionEventType.ReconnectionRunning, connections: [] });
+ 			const input = context({ sessionType: 'agent-host-copilotcli' });
+ 			const visibility = [fixture.isVisible(input)];
+@@ -243,7 +243,7 @@ suite('AgentHostRemoteByokNotification',
+ 			visibility.push(fixture.isVisible(input));
+ 			fixture.setWorkspaceConnection(new ReconnectionPermanentFailureEvent('test', 0, 1, true));
+ 			visibility.push(fixture.isVisible(input));
+-			assert.deepStrictEqual(visibility, [false, true, false, false, true, false]);
++			assert.deepStrictEqual(visibility, [false, false, false, false, false, false]);
+ 		});
+ 	}
+ 
+@@ -264,7 +264,7 @@ suite('AgentHostRemoteByokNotification',
+ 			assert.deepStrictEqual({
+ 				visible: fixture.isVisible(context({ sessionType: 'agent-host-copilotcli' })),
+ 				environmentReads: fixture.environmentReads,
+-			}, { visible: state === PersistentConnectionEventType.ConnectionGain, environmentReads: 0 });
++			}, { visible: false, environmentReads: 0 });
+ 		});
+ 	}
+ 
+@@ -289,7 +289,7 @@ suite('AgentHostRemoteByokNotification',
+ 			fixture.isVisible(context({ sessionType: 'agent-host-copilotcli' })),
+ 			fixture.isVisible(),
+ 			fixture.isVisible(context({ sessionType: 'agent-host-claude' })),
+-		], [true, false, false]);
++		], [false, false, false]);
+ 	});
+ 
+ 	test('refreshes existing inputs when the first BYOK model is added', () => {
+Index: code-server/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts
++++ code-server/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts
+@@ -40,6 +40,7 @@ import { agentsWindowAgentHostClientInfo
+ import { agentHostAuthority, agentHostLabelFormatter, fromAgentHostUri, identityAgentHostResourceUriMapper } from '../../../../platform/agentHost/common/agentHostUri.js';
+ import { IAgentHostFileSystemService } from '../common/agentHostFileSystemService.js';
+ import { EditorRemoteAgentHostTransport } from '../common/editorRemoteAgentHostTransport.js';
++import { AgentHostClientByokLmChannel } from '../../../../platform/agentHost/common/agentHostClientByokLmChannel.js';
+ 
+ const REMOTE_NOT_SUPPORTED = (op: string) => new Error(`${op} is not supported when the agent host runs on a remote.`);
+ const LOG_PREFIX = '[AgentHost:remote]';
+@@ -134,6 +135,7 @@ export class EditorRemoteAgentHostServic
+ 		const address = `vscode-remote://${connection.remoteAuthority}`;
+ 		const clientInfo = environmentService.isSessionsWindow ? agentsWindowAgentHostClientInfo : editorWindowAgentHostClientInfo;
+ 		this._protocolClient = this._register(instantiationService.createInstance(AgentHostProtocolClient, address, createTransport, { clientInfo }));
++		this._protocolClient.serveRemoteByok(instantiationService.createInstance(AgentHostClientByokLmChannel));
+ 		// Resources this client hands out (e.g. debug-log artifacts) are stamped with the
+ 		// address-derived authority, so register it for reads. The ambient `local` authority
+ 		// registered elsewhere covers a different URI namespace.
