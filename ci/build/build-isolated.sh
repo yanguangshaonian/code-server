@@ -34,6 +34,7 @@ export TMPDIR="$build_root/tmp" npm_config_cache="$build_root/npm-cache"
 export XDG_CACHE_HOME="$build_root/cache" GIT_CONFIG_NOSYSTEM=1
 export npm_config_devdir="$build_root/node-gyp" ELECTRON_CACHE="$build_root/electron-cache"
 export PLAYWRIGHT_BROWSERS_PATH="$build_root/playwright"
+export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}"
 export VERSION="$version" RELEASE_PATH=release KEEP_MODULES=1 MINIFY=true CI=1
 export VSCODE_TARGET=linux-x64 ARCH=amd64
