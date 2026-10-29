@@ -28,6 +28,18 @@ thinking: true, 特殊请求头等无法直接表达的配置仍会被 direct �
 真实 BYOK 在全部浏览器关闭后的多轮任务持续执行仍需端到端验证.
 
 首次准备与构建:
+统一入口: bash ci/build/build-isolated.sh
+先提交主仓库修改, 脚本只构建当前 HEAD. 使用符合子模块 .nvmrc 的 Node,
+并安装 git, npm, quilt, jq, rsync, nfpm, envsubst, timeout 等工具及官方原生编译依赖.
+每次在 /tmp/vscode/build-<commit>-<随机后缀>/ 下建立独立源码和依赖,
+日志位于 logs/, 安装包位于 source/release-packages/, 校验值为 SHA256SUMS.
+中间文件, npm 缓存和临时文件也放在该目录, 不向原项目写入构建产物.
+脚本不安装系统包, 不部署服务, 不复用已有工作区的 node_modules.
+网络代理和原生编译工具按宿主机环境准备. 失败时保留目录及分阶段日志.
+该入口调用完整官方 build:vscode 流程, 最终生成 server-web release,
+并检查发布 product.json 与前端 bundle 的 commit/quality 一致性.
+本次已验证脚本语法和预检, 尚未通过该入口执行完整发布构建.
+
 按照 docs/CONTRIBUTING.md 安装项目要求的 Node 和依赖.
 git submodule update --init --recursive
 quilt push -a --fuzz=0
