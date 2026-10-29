@@ -1,0 +1,413 @@
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostNewSessionFolderService.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostNewSessionFolderService.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostNewSessionFolderService.ts
+@@ -14,6 +14,9 @@ import { IUriIdentityService } from '../
+ import { IWorkspaceContextService } from '../../../../../../platform/workspace/common/workspace.js';
+ import { RootState, type ISessionFolderPickerDecision } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+ import { IChatService } from '../../../common/chatService/chatService.js';
++import { IEditorService } from '../../../../../services/editor/common/editorService.js';
++import { EditorResourceAccessor, SideBySideEditor } from '../../../../../common/editor.js';
++import { IExplorerService } from '../../../../files/browser/files.js';
+ 
+ export const IAgentHostNewSessionFolderService = createDecorator<IAgentHostNewSessionFolderService>('agentHostNewSessionFolderService');
+ 
+@@ -190,13 +193,13 @@ export interface IAgentHostNewSessionFol
+ 	 * The folder chosen for the given session resource, or `undefined` if the
+ 	 * user has not made an explicit choice.
+ 	 */
+-	getFolder(sessionResource: URI): URI | undefined;
++	getFolder(sessionResource: URI, explicitOnly?: boolean): URI | undefined;
+ 
+ 	/**
+ 	 * Record the folder chosen for the given session resource. Fires
+ 	 * {@link onDidChangeFolder} when the value actually changes.
+ 	 */
+-	setFolder(sessionResource: URI, folder: URI): void;
++	setFolder(sessionResource: URI, folder: URI, automatic?: boolean): void;
+ 
+ 	/**
+ 	 * Forget any choice recorded for the given session resource.
+@@ -231,6 +234,7 @@ export class AgentHostNewSessionFolderSe
+ 	declare readonly _serviceBrand: undefined;
+ 
+ 	private readonly _folders = new ResourceMap<URI>();
++	private readonly _automaticFolders = new ResourceMap<boolean>();
+ 
+ 	/**
+ 	 * The most recently chosen folder in this window. Window-level "sticky"
+@@ -246,6 +250,8 @@ export class AgentHostNewSessionFolderSe
+ 		@IChatService chatService: IChatService,
+ 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
+ 		@IUriIdentityService private readonly _uriIdentityService: IUriIdentityService,
++		@IEditorService private readonly _editorService: IEditorService,
++		@IExplorerService private readonly _explorerService: IExplorerService,
+ 	) {
+ 		super();
+ 
+@@ -281,12 +287,18 @@ export class AgentHostNewSessionFolderSe
+ 		}));
+ 	}
+ 
+-	getFolder(sessionResource: URI): URI | undefined {
++	getFolder(sessionResource: URI, explicitOnly = false): URI | undefined {
++		if (explicitOnly && this._automaticFolders.get(sessionResource)) {
++			return undefined;
++		}
+ 		return this._folders.get(sessionResource);
+ 	}
+ 
+-	setFolder(sessionResource: URI, folder: URI): void {
+-		this._defaultFolder = folder;
++	setFolder(sessionResource: URI, folder: URI, automatic = false): void {
++		this._automaticFolders.set(sessionResource, automatic);
++		if (!automatic) {
++			this._defaultFolder = folder;
++		}
+ 		const existing = this._folders.get(sessionResource);
+ 		if (existing?.toString() === folder.toString()) {
+ 			return;
+@@ -296,12 +308,24 @@ export class AgentHostNewSessionFolderSe
+ 	}
+ 
+ 	clear(sessionResource: URI): void {
++		this._automaticFolders.delete(sessionResource);
+ 		if (this._folders.delete(sessionResource)) {
+ 			this._onDidChangeFolder.fire(sessionResource);
+ 		}
+ 	}
+ 
+ 	getDefaultFolder(): URI | undefined {
++		const resource = EditorResourceAccessor.getOriginalUri(this._editorService.activeEditor, { supportSideBySide: SideBySideEditor.PRIMARY });
++		const activeFolder = resource && this._workspaceContextService.getWorkspaceFolder(resource);
++		if (activeFolder) {
++			return activeFolder.uri;
++		}
++		if (!resource) {
++			const selected = this._explorerService.getContext(false).find(item => item.isDirectory && this._workspaceContextService.getWorkspaceFolder(item.resource));
++			if (selected) {
++				return selected.resource;
++			}
++		}
+ 		const stored = this._defaultFolder;
+ 		if (stored && this._workspaceContextService.getWorkspace().folders.some(folder => this._uriIdentityService.extUri.isEqual(folder.uri, stored))) {
+ 			return stored;
+@@ -316,8 +340,8 @@ export class AgentHostNewSessionFolderSe
+ 		// even before the workspace-change listener clears it (order-independent).
+ 		// Uses the same provider-aware comparator as removal detection so both
+ 		// checks agree on case-sensitive remotes.
+-		const explicit = this._folders.get(sessionResource);
+-		if (explicit && folders.some(folder => this._uriIdentityService.extUri.isEqual(folder.uri, explicit))) {
++		const explicit = this.getFolder(sessionResource, true);
++		if (explicit && folders.some(folder => this._uriIdentityService.extUri.isEqualOrParent(explicit, folder.uri))) {
+ 			return explicit;
+ 		}
+ 		return this.getDefaultFolder() ?? folders[0]?.uri;
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -19,7 +19,7 @@ import { LRUCache, ResourceMap, Resource
+ import { Schemas } from '../../../../../../base/common/network.js';
+ import { equals } from '../../../../../../base/common/objects.js';
+ import { autorun, autorunPerKeyedItem, constObservable, derived, derivedOpts, IObservable, IReader, ISettableObservable, observableFromEvent, observableSignalFromEvent, observableValue, transaction, waitForState } from '../../../../../../base/common/observable.js';
+-import { extUriBiasedIgnorePathCase, isEqual } from '../../../../../../base/common/resources.js';
++import { extUriBiasedIgnorePathCase, isEqual, isEqualAuthority } from '../../../../../../base/common/resources.js';
+ import { StopWatch } from '../../../../../../base/common/stopwatch.js';
+ import { AgentHostFirstResponseTiming, nextRendererRootInvocationOrdinal, type AgentHostFirstResponseClassification, type AgentHostFirstResponseOutcome, type IAgentHostFirstResponseEvent } from './agentHostFirstResponseTelemetry.js';
+ import { AgentHostSteeringMessageHandoff } from './agentHostSteeringMessageHandoff.js';
+@@ -7715,7 +7715,9 @@ export class AgentHostSessionHandler ext
+ 			}
+ 			if (forwardEntry) {
+ 				const attachment = this._convertVariableToAttachment(entry, sessionResource, message);
+-				if (!Array.isArray(attachment) && attachment) {
++				if (Array.isArray(attachment)) {
++					attachments.push(...attachment);
++				} else if (attachment) {
+ 					attachments.push(attachment);
+ 				}
+ 			}
+@@ -7873,6 +7875,13 @@ export class AgentHostSessionHandler ext
+ 			if (uri && this._isUnsavedResource(uri)) {
+ 				const embedded = this._buildUnsavedEditorAttachment(uri, v, referenceRange);
+ 				if (embedded) {
++					let source = this._config.connection.resourceUris.toAgentHost(uri);
++					if (source.scheme === Schemas.vscodeRemote && this._workspaceContextService.getWorkspace().folders.some(folder => folder.uri.scheme === source.scheme && isEqualAuthority(folder.uri.authority, source.authority))) {
++						source = source.with({ scheme: Schemas.file, authority: '' });
++					}
++					if (isCopilotAgentHostProvider(this._config.provider) && source.scheme === Schemas.file) {
++						return [embedded, this._toSimpleAttachment(v.name, `未保存内容的真实源文件路径: ${JSON.stringify(source.fsPath)}. 附件是缓冲区快照, 不是编辑目标. 编辑源文件前核对未保存内容, 不要查找其他目录的同名文件.`, undefined, 'source-file-context')];
++					}
+ 					return embedded;
+ 				}
+ 				if (uri.scheme !== Schemas.file) {
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionListController.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionListController.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionListController.ts
+@@ -139,7 +139,7 @@ export class AgentHostSessionListControl
+ 
+ 		// Graduate the draft's backend and chip selections without recreating a matching session.
+ 		if (request.untitledResource) {
+-			const workingDirectory = this._newSessionFolderService.getFolder(request.untitledResource)
++			const workingDirectory = this._newSessionFolderService.getFolder(request.untitledResource, true)
+ 				?? this._newSessionFolderService.getDefaultFolder()
+ 				?? this._workspaceContextService.getWorkspace().folders[0]?.uri;
+ 			// Carry the chosen folder forward onto the real resource so the
+@@ -149,6 +149,7 @@ export class AgentHostSessionListControl
+ 			// briefly fire a change while the widget still points at the untitled
+ 			// resource, flickering the chip back to the first folder.
+ 			if (workingDirectory) {
++				this._newSessionFolderService.setFolder(request.untitledResource, workingDirectory);
+ 				this._newSessionFolderService.setFolder(item.resource, workingDirectory);
+ 			}
+ 			// Carry any imported ("Continue in…") conversation snapshot from the
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
+@@ -980,7 +980,7 @@ export class ChatWidget extends Disposab
+ 		// `setFolder` deliberately overrides any prior selection, since a hidden
+ 		// picker leaves the user no way to choose.
+ 		if (update.selectPrimary && sessionResource) {
+-			this._agentHostNewSessionFolderService.setFolder(sessionResource, update.selectPrimary);
++			this._agentHostNewSessionFolderService.setFolder(sessionResource, update.selectPrimary, true);
+ 		}
+ 	}
+ 
+Index: code-server/lib/vscode/src/vs/workbench/services/agentHost/common/editorRemoteAgentHostTransport.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/services/agentHost/common/editorRemoteAgentHostTransport.ts
++++ code-server/lib/vscode/src/vs/workbench/services/agentHost/common/editorRemoteAgentHostTransport.ts
+@@ -170,7 +170,15 @@ export class EditorRemoteAgentHostTransp
+ 	}
+ 
+ 	private _mapMessage(message: Message, map: (uri: string) => string): Message {
+-		return message.agent ? { ...message, agent: { ...message.agent, uri: map(message.agent.uri) } } : message;
++		return {
++			...message,
++			...(message.agent ? { agent: { ...message.agent, uri: map(message.agent.uri) } } : {}),
++			...(message.attachments ? {
++				attachments: message.attachments.map(attachment => attachment.type === 'resource'
++					? { ...attachment, uri: map(attachment.uri) }
++					: attachment),
++			} : {}),
++		};
+ 	}
+ 
+ 	private _mapActiveClient(activeClient: SessionActiveClient, map: (uri: string) => string): SessionActiveClient {
+Index: code-server/lib/vscode/src/vs/workbench/services/agentHost/test/common/editorRemoteAgentHostTransport.test.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/services/agentHost/test/common/editorRemoteAgentHostTransport.test.ts
++++ code-server/lib/vscode/src/vs/workbench/services/agentHost/test/common/editorRemoteAgentHostTransport.test.ts
+@@ -235,6 +235,28 @@ suite('EditorRemoteAgentHostTransport',
+ 		}]);
+ 	});
+ 
++	test('maps resource attachments without mutating source messages or snapshots', () => {
++		const { underlying, transport } = createTransport();
++		for (const type of [ActionType.ChatTurnStarted, ActionType.ChatPendingMessageSet]) {
++			const message = {
++				jsonrpc: '2.0', method: 'dispatchAction', params: { channel: chat, clientSeq: 1, action: {
++					type, turnId: 'turn', startedAt: timestamp, id: 'queued', kind: PendingMessageKind.Queued,
++					message: { ...agentMessage(undefined), attachments: [
++						{ type: 'resource', uri: remoteDirectory, label: 'source' },
++						{ type: 'resource', uri: otherRemoteDirectory, label: 'other' },
++						{ type: 'embeddedResource', data: 'YQ==', contentType: 'text/plain' },
++					] },
++				} },
++			} as ProtocolMessage;
++			const original = JSON.stringify(message);
++			transport.send(message);
++			const expected = JSON.parse(original);
++			expected.params.action.message.attachments[0].uri = fileDirectory;
++			assert.deepStrictEqual(underlying.messages.at(-1), expected);
++			assert.strictEqual(JSON.stringify(message), original);
++		}
++	});
++
+ 	test('maps a correlated response once for all listeners', () => {
+ 		const { underlying, transport, received } = createTransport();
+ 		const secondReceived: ProtocolMessage[] = [];
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+@@ -119,6 +119,7 @@ import { AgentHostSnapshotController } f
+ import { IFileService } from '../../../../../../platform/files/common/files.js';
+ import { TestChatEntitlementService, TestFileService } from '../../../../../test/common/workbenchTestServices.js';
+ import { IEditorService } from '../../../../../services/editor/common/editorService.js';
++import { IExplorerService } from '../../../../files/browser/files.js';
+ import { isResourceEditorInput, ITextDiffEditorPane, IUntypedEditorInput } from '../../../../../common/editor.js';
+ import { IResourceEditorInput } from '../../../../../../platform/editor/common/editor.js';
+ import { EditorInput } from '../../../../../common/editor/editorInput.js';
+@@ -1236,7 +1237,7 @@ function createTestServices(disposables:
+ 		take: () => undefined,
+ 		rename: () => { },
+ 	} as Partial<IAgentHostImportConversationStore> as IAgentHostImportConversationStore);
+-	const newSessionFolderService = disposables.add(new AgentHostNewSessionFolderService(chatService as Partial<IChatService> as IChatService, instantiationService.get(IWorkspaceContextService), { extUri: extUriBiasedIgnorePathCase } as Partial<IUriIdentityService> as IUriIdentityService));
++	const newSessionFolderService = disposables.add(new AgentHostNewSessionFolderService(chatService as Partial<IChatService> as IChatService, instantiationService.get(IWorkspaceContextService), { extUri: extUriBiasedIgnorePathCase } as Partial<IUriIdentityService> as IUriIdentityService, { activeEditor: undefined } as IEditorService, { getContext: () => [] } as unknown as IExplorerService));
+ 	instantiationService.stub(IAgentHostNewSessionFolderService, newSessionFolderService);
+ 	const customizationsByScope = new Map<string, { readonly customizations: IObservable<readonly ClientPluginCustomization[]>; readonly customAgents: IObservable<readonly AgentCustomization[]>; readonly tools: IObservable<readonly ToolDefinition[]>; readonly isResolved: IObservable<boolean>; readonly whenResolved: Promise<void> }>();
+ 	const scopeKey = (sessionType: string, roots: readonly URI[]) => `${sessionType}\n${roots.map(root => root.toString()).sort().join('\n')}`;
+@@ -15054,7 +15055,9 @@ suite('AgentHostChatContribution', () =>
+ 					await turnPromise;
+ 
+ 					const turnAction = agentHostService.turnActions[0].action as ITurnStartedAction;
+-					assert.deepStrictEqual({ session, attachments: turnAction.message.attachments }, {
++					const sourceContext = turnAction.message.attachments?.find(attachment => attachment.displayKind === 'source-file-context');
++					assert.strictEqual(sourceContext?.type === MessageAttachmentKind.Simple && sourceContext.modelRepresentation?.includes(uri.fsPath), expected === 'embedded' && uri.scheme === Schemas.file ? true : false);
++					assert.deepStrictEqual({ session, attachments: turnAction.message.attachments?.filter(attachment => attachment.displayKind !== 'source-file-context') }, {
+ 						session: buildDefaultChatUri(AgentSession.uri('ahp-session', 'session-one').toString()),
+ 						attachments: expected === 'embedded'
+ 							? [{ type: MessageAttachmentKind.EmbeddedResource, label: 'test', displayKind: 'document', data: encodeBase64(VSBuffer.fromString(text)), contentType: 'text/plain' }]
+@@ -15840,6 +15843,25 @@ suite('AgentHostChatContribution', () =>
+ 			]);
+ 		}));
+ 
++		test('preserves the source path alongside an unsaved remote editor snapshot', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
++			const { sessionHandler, agentHostService, chatAgentService, modelService, workingCopyService, instantiationService } = createContribution(disposables, { provider: 'copilotcli' });
++			const fileUri = URI.parse('vscode-remote://test-host/workspace/project/src/design.txt');
++			const workspaceService = instantiationService.get(IWorkspaceContextService);
++			const workspace = workspaceService.getWorkspace();
++			workspace.folders.push({ uri: URI.parse('vscode-remote://test-host/workspace/project'), name: 'project', index: workspace.folders.length, toResource: path => URI.joinPath(fileUri, path) });
++			Object.defineProperty(workspaceService, 'getWorkspace', { value: () => workspace, configurable: true });
++			modelService.setModelContent(fileUri, 'unsaved source');
++			workingCopyService.setDirty(fileUri, true);
++			const { turnPromise, session, turnId, fire } = await startTurn(sessionHandler, agentHostService, chatAgentService, disposables, {
++				message: 'check source', variables: { variables: [upcastPartial({ kind: 'file', id: 'remote-source', name: 'design.txt', value: fileUri })] },
++			});
++			fire({ type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', session, turnId } as ChatAction);
++			await turnPromise;
++			const attachments = (agentHostService.turnActions[0].action as ITurnStartedAction).message.attachments;
++			assert.ok(attachments?.some(attachment => attachment.type === MessageAttachmentKind.EmbeddedResource && attachment.data === encodeBase64(VSBuffer.fromString('unsaved source'))));
++			assert.ok(attachments?.some(attachment => attachment.type === MessageAttachmentKind.Simple && attachment.displayKind === 'source-file-context' && attachment.modelRepresentation?.includes('/workspace/project/src/design.txt')));
++		}));
++
+ 		test('active editor implicit context for a dirty saved file is inlined for the Copilot CLI backend', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+ 			const { sessionHandler, agentHostService, chatAgentService, chatWidgetService, modelService, workingCopyService } = createContribution(disposables, { provider: 'copilotcli' });
+ 			const sessionResource = URI.from({ scheme: 'agent-host-copilot', path: '/copilot-implicit-dirty' });
+@@ -15859,7 +15881,8 @@ suite('AgentHostChatContribution', () =>
+ 
+ 			assert.strictEqual(agentHostService.turnActions.length, 1);
+ 			const turnAction = agentHostService.turnActions[0].action as ITurnStartedAction;
+-			assert.deepStrictEqual(turnAction.message.attachments, [
++			assert.ok(turnAction.message.attachments?.some(attachment => attachment.type === MessageAttachmentKind.Simple && attachment.displayKind === 'source-file-context' && attachment.modelRepresentation?.includes(fileUri.fsPath)));
++			assert.deepStrictEqual(turnAction.message.attachments?.filter(attachment => attachment.displayKind !== 'source-file-context'), [
+ 				{ type: MessageAttachmentKind.EmbeddedResource, label: 'foo.ts', displayKind: 'document', data: encodeBase64(VSBuffer.fromString('edited but not saved')), contentType: 'text/plain' },
+ 			]);
+ 		}));
+@@ -15883,7 +15906,8 @@ suite('AgentHostChatContribution', () =>
+ 
+ 			assert.strictEqual(agentHostService.turnActions.length, 1);
+ 			const turnAction = agentHostService.turnActions[0].action as ITurnStartedAction;
+-			assert.deepStrictEqual(turnAction.message.attachments, [
++			assert.ok(turnAction.message.attachments?.some(attachment => attachment.type === MessageAttachmentKind.Simple && attachment.displayKind === 'source-file-context' && attachment.modelRepresentation?.includes(fileUri.fsPath)));
++			assert.deepStrictEqual(turnAction.message.attachments?.filter(attachment => attachment.displayKind !== 'source-file-context'), [
+ 				{ type: MessageAttachmentKind.EmbeddedResource, label: 'foo.ts', displayKind: 'selection', data: encodeBase64(VSBuffer.fromString('second line\nthird line\nfourth li')), contentType: 'text/plain', selection: { range: { start: { line: 1, character: 0 }, end: { line: 3, character: 9 } } } },
+ 			]);
+ 		}));
+@@ -16020,7 +16044,8 @@ suite('AgentHostChatContribution', () =>
+ 
+ 			assert.strictEqual(agentHostService.turnActions.length, 1);
+ 			const turnAction = agentHostService.turnActions[0].action as ITurnStartedAction;
+-			assert.deepStrictEqual(turnAction.message.attachments, [
++			assert.ok(turnAction.message.attachments?.some(attachment => attachment.type === MessageAttachmentKind.Simple && attachment.displayKind === 'source-file-context' && attachment.modelRepresentation?.includes(fileUri.fsPath)));
++			assert.deepStrictEqual(turnAction.message.attachments?.filter(attachment => attachment.displayKind !== 'source-file-context'), [
+ 				{ type: MessageAttachmentKind.EmbeddedResource, label: 'foo.ts', displayKind: 'document', data: encodeBase64(VSBuffer.fromString('edited but not saved')), contentType: 'text/plain' },
+ 			]);
+ 		}));
+@@ -16072,7 +16097,8 @@ suite('AgentHostChatContribution', () =>
+ 
+ 			assert.strictEqual(agentHostService.turnActions.length, 1);
+ 			const turnAction = agentHostService.turnActions[0].action as ITurnStartedAction;
+-			assert.deepStrictEqual(turnAction.message.attachments, [
++			assert.strictEqual(turnAction.message.attachments?.filter(attachment => attachment.displayKind === 'source-file-context').length, 1);
++			assert.deepStrictEqual(turnAction.message.attachments?.filter(attachment => attachment.displayKind !== 'source-file-context'), [
+ 				{ type: MessageAttachmentKind.EmbeddedResource, label: 'foo.ts', displayKind: 'document', data: encodeBase64(VSBuffer.fromString('edited but not saved')), contentType: 'text/plain' },
+ 			]);
+ 		}));
+@@ -16096,7 +16122,8 @@ suite('AgentHostChatContribution', () =>
+ 				await turnPromise;
+ 
+ 				const turnAction = agentHostService.turnActions[0].action as ITurnStartedAction;
+-				assert.deepStrictEqual(turnAction.message.attachments, [
++				assert.strictEqual(turnAction.message.attachments?.some(attachment => attachment.type === MessageAttachmentKind.Simple && attachment.displayKind === 'source-file-context' && attachment.modelRepresentation?.includes(fileUri.fsPath)), provider !== 'codex');
++				assert.deepStrictEqual(turnAction.message.attachments?.filter(attachment => attachment.displayKind !== 'source-file-context'), [
+ 					{ type: MessageAttachmentKind.EmbeddedResource, label: 'foo.ts', displayKind: 'selection', data: encodeBase64(VSBuffer.fromString('second line\nthird line\nfourth li')), contentType: 'text/plain', selection: { range: { start: { line: 1, character: 0 }, end: { line: 3, character: 9 } } }, _meta: { provider: 'fs', score: 0.42 } },
+ 				]);
+ 			}));
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostNewSessionFolderService.test.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostNewSessionFolderService.test.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostNewSessionFolderService.test.ts
+@@ -14,6 +14,10 @@ import { IUriIdentityService } from '../
+ import { IWorkspaceContextService, IWorkspaceFolder, IWorkspace, IWorkspaceFoldersChangeEvent } from '../../../../../../platform/workspace/common/workspace.js';
+ import type { AgentInfo, RootState } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+ import { IChatService } from '../../../common/chatService/chatService.js';
++import { IEditorService } from '../../../../../services/editor/common/editorService.js';
++import { EditorInput } from '../../../../../common/editor/editorInput.js';
++import { IExplorerService } from '../../../../files/browser/files.js';
++import { ExplorerItem } from '../../../../files/common/explorerModel.js';
+ import { AgentHostNewSessionFolderService, computeDesiredWorkingDirectories, computeWorkingDirectories } from '../../../browser/agentSessions/agentHost/agentHostNewSessionFolderService.js';
+ 
+ suite('AgentHostNewSessionFolderService', () => {
+@@ -24,6 +28,8 @@ suite('AgentHostNewSessionFolderService'
+ 	let onDidDisposeSession: Emitter<{ readonly sessionResources: readonly URI[]; readonly reason: 'cleared' }>;
+ 	let onDidChangeWorkspaceFolders: Emitter<IWorkspaceFoldersChangeEvent>;
+ 	let workspaceFolders: URI[];
++	let activeResource: URI | undefined;
++	let selectedFolder: URI | undefined;
+ 
+ 	setup(() => {
+ 		onDidDisposeSession = ds.add(new Emitter<{ readonly sessionResources: readonly URI[]; readonly reason: 'cleared' }>());
+@@ -32,13 +38,19 @@ suite('AgentHostNewSessionFolderService'
+ 			override readonly onDidDisposeSession = onDidDisposeSession.event;
+ 		};
+ 		workspaceFolders = [folderA, folderB];
++		activeResource = undefined;
++		selectedFolder = undefined;
+ 		const workspaceContextService = new class extends mock<IWorkspaceContextService>() {
+ 			override readonly onDidChangeWorkspaceFolders = onDidChangeWorkspaceFolders.event;
+ 			override getWorkspace(): IWorkspace {
+ 				return { folders: workspaceFolders.map(uri => ({ uri } as IWorkspaceFolder)) } as IWorkspace;
+ 			}
++			override getWorkspaceFolder(resource: URI): IWorkspaceFolder | null {
++				const folder = workspaceFolders.find(uri => extUriBiasedIgnorePathCase.isEqualOrParent(resource, uri));
++				return folder ? wsFolder(folder) : null;
++			}
+ 		};
+-		service = ds.add(new AgentHostNewSessionFolderService(chatService, workspaceContextService, { extUri: extUriBiasedIgnorePathCase } as Partial<IUriIdentityService> as IUriIdentityService));
++		service = ds.add(new AgentHostNewSessionFolderService(chatService, workspaceContextService, { extUri: extUriBiasedIgnorePathCase } as Partial<IUriIdentityService> as IUriIdentityService, { get activeEditor() { return activeResource ? { resource: activeResource } as EditorInput : undefined; } } as IEditorService, { getContext: () => selectedFolder ? [{ resource: selectedFolder, isDirectory: true } as ExplorerItem] : [] } as unknown as IExplorerService));
+ 		cleanup = ds.add(new DisposableStore());
+ 	});
+ 
+@@ -50,6 +62,19 @@ suite('AgentHostNewSessionFolderService'
+ 
+ 	const wsFolder = (uri: URI): IWorkspaceFolder => ({ uri, index: 0, name: uri.path, toResource: relativePath => URI.joinPath(uri, relativePath) });
+ 
++	test('selects the active project instead of an automatic preview while respecting manual choice', () => {
++		service.setFolder(sessionA, folderA, true);
++		activeResource = URI.joinPath(folderB, 'main.cpp');
++		assert.strictEqual(service.resolveNewSessionPrimary(sessionA)?.toString(), folderB.toString());
++		service.setFolder(sessionA, folderA);
++		assert.strictEqual(service.resolveNewSessionPrimary(sessionA)?.toString(), folderA.toString());
++	});
++
++	test('selects an explorer descendant directory without an active file', () => {
++		selectedFolder = URI.joinPath(folderB, 'src');
++		assert.strictEqual(service.resolveNewSessionPrimary(sessionA)?.toString(), selectedFolder.toString());
++	});
++
+ 	test('set/get/clear round-trips and fires onDidChange on real changes only', () => {
+ 		const changes: string[] = [];
+ 		cleanup.add(service.onDidChangeFolder(uri => changes.push(uri.toString())));
+@@ -210,7 +235,7 @@ suite('AgentHostNewSessionFolderService'
+ 		};
+ 		// A provider-aware, case-sensitive comparator (as IUriIdentityService.extUri
+ 		// resolves for a case-sensitive remote filesystem).
+-		const caseSensitive = ds.add(new AgentHostNewSessionFolderService(chatSvc, wsSvc, { extUri: new ExtUri(() => false) } as Partial<IUriIdentityService> as IUriIdentityService));
++		const caseSensitive = ds.add(new AgentHostNewSessionFolderService(chatSvc, wsSvc, { extUri: new ExtUri(() => false) } as Partial<IUriIdentityService> as IUriIdentityService, { activeEditor: undefined } as IEditorService, { getContext: () => [] } as unknown as IExplorerService));
+ 
+ 		caseSensitive.setFolder(sessionA, repoUpper);
+ 		remoteFolders = [repoLower];

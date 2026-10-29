@@ -29,3 +29,4 @@ remote-secret-storage.diff
 csp-hashes.diff
 remote-byok-models.diff
 server-web-build.diff
+editor-source-context.diff
