@@ -1,3 +1,69 @@
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostChatContribution.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostChatContribution.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostChatContribution.ts
+@@ -10,16 +10,21 @@
+ import { Disposable, DisposableMap, DisposableStore, IDisposable, MutableDisposable, toDisposable } from '../../../../../../base/common/lifecycle.js';
+ import { autorun, observableFromEvent } from '../../../../../../base/common/observable.js';
+ import { mark } from '../../../../../../base/common/performance.js';
++import { Schemas } from '../../../../../../base/common/network.js';
++import { URI } from '../../../../../../base/common/uri.js';
+ import { ThemeIcon } from '../../../../../../base/common/themables.js';
+ import { localize } from '../../../../../../nls.js';
+ import { affectsAgentHostProviderPreference, getPolicyUnavailableLocalAgentHostProviders, IAgentHostService, protectedResourcesRequireGitHubCopilotSignIn, shouldSurfaceLocalAgentHostProvider, type AgentProvider } from '../../../../../../platform/agentHost/common/agentService.js';
+ import { IAgentHostEnablementService } from '../../../../../../platform/agentHost/common/agentHostEnablementService.js';
+-import { AGENT_HOST_SCHEME, agentHostAuthority, LOCAL_AGENT_HOST_AUTHORITY } from '../../../../../../platform/agentHost/common/agentHostUri.js';
++import { AGENT_HOST_SCHEME, agentHostAuthority, fromAgentHostUri, isAgentHostContentRefUri, LOCAL_AGENT_HOST_AUTHORITY } from '../../../../../../platform/agentHost/common/agentHostUri.js';
+ import { type ProtectedResourceMetadata } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
+ import { NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
+ import { type AgentInfo, type RootState } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+ import { CHATGPT_SUBSCRIPTION_MODEL_SOURCE_ID } from '../../../../../../platform/agentHost/common/agentModelSource.js';
+ import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
++import { ICommandService } from '../../../../../../platform/commands/common/commands.js';
++import { IFileService } from '../../../../../../platform/files/common/files.js';
++import { IOpenerService } from '../../../../../../platform/opener/common/opener.js';
+ import { IDefaultAccountService } from '../../../../../../platform/defaultAccount/common/defaultAccount.js';
+ import { IInstantiationService, ServicesAccessor } from '../../../../../../platform/instantiation/common/instantiation.js';
+ import { ILogService } from '../../../../../../platform/log/common/log.js';
+@@ -157,6 +162,9 @@
+ 		@IAgentHostCustomizationService private readonly _agentHostCustomizationService: IAgentHostCustomizationService,
+ 		@IAgentHostProtectedResourcesService private readonly _protectedResourcesService: IAgentHostProtectedResourcesService,
+ 		@IAgentHostEnablementService private readonly _agentHostEnablementService: IAgentHostEnablementService,
++		@IOpenerService openerService: IOpenerService,
++		@IFileService fileService: IFileService,
++		@ICommandService commandService: ICommandService,
+ 	) {
+ 		super();
+ 		this._authRecovery = this._instantiationService.createInstance(AgentHostAuthenticationRecovery);
+@@ -164,6 +172,28 @@
+ 		this._isLocalAgentHost = !environmentService.remoteAuthority;
+ 		this._connectionAuthority = environmentService.remoteAuthority ? agentHostAuthority(`vscode-remote://${environmentService.remoteAuthority}`) : LOCAL_AGENT_HOST_AUTHORITY;
+ 		this._enableSmokeTestDriver = !!environmentService.enableSmokeTestDriver;
++		if (environmentService.remoteAuthority) {
++			const remoteAuthority = environmentService.remoteAuthority;
++			this._register(openerService.registerOpener({
++				open: async (target, options) => {
++					const uri = typeof target === 'string' ? URI.parse(target) : target;
++					if (uri.scheme !== AGENT_HOST_SCHEME || uri.authority !== this._connectionAuthority || isAgentHostContentRefUri(uri) || (options && 'openExternal' in options && options.openExternal)) {
++						return false;
++					}
++					const source = fromAgentHostUri(uri);
++					if (source.scheme !== Schemas.file) {
++						return false;
++					}
++					const resource = source.with({ scheme: Schemas.vscodeRemote, authority: remoteAuthority });
++					const stat = await fileService.stat(resource.with({ fragment: '' }));
++					if (stat.isDirectory) {
++						await commandService.executeCommand('revealInExplorer', resource.with({ fragment: '' }));
++						return true;
++					}
++					return openerService.open(resource, options);
++				},
++			}));
++		}
+ 
+ 		this._register(autorun(reader => {
+ 			const enabled = this._agentHostEnablementService.enabled.read(reader);
 Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostNewSessionFolderService.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostNewSessionFolderService.ts
