@@ -1,3 +1,39 @@
+Index: code-server/lib/vscode/src/vs/platform/agentHost/node/agentHostMain.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/agentHostMain.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/node/agentHostMain.ts
+@@ -427,6 +427,7 @@
+ 					completionTriggerCharacters,
+ 					terminalCommandPrefix: BANG_COMMAND_PREFIX,
+ 					otlpLogEmitter,
++					byokLmBridgeRegistry,
+ 				},
+ 				clientFileSystemProvider,
+ 			));
+@@ -525,6 +526,7 @@
+ 		instantiationService,
+ 		logService,
+ 		otlpLogEmitter,
++		byokLmBridgeRegistry,
+ 		protocolIngressDisposables,
+ 		hostLaunchKind,
+ 		count => connectionCountEmitter.fire(count),
+@@ -621,6 +623,7 @@
+ 	instantiationService: IInstantiationService,
+ 	logService: ILogService,
+ 	otlpLogEmitter: OtlpLogEmitter,
++	byokLmBridgeRegistry: ByokLmBridgeRegistry,
+ 	disposables: DisposableStore,
+ 	hostLaunchKind: AgentHostLaunchKind,
+ 	onConnectionCountChanged: (count: number) => void,
+@@ -670,6 +673,7 @@
+ 			completionTriggerCharacters,
+ 			terminalCommandPrefix: BANG_COMMAND_PREFIX,
+ 			otlpLogEmitter,
++			byokLmBridgeRegistry,
+ 		},
+ 		clientFileSystemProvider,
+ 	));
 Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/common/chatSessionsService.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/common/chatSessionsService.ts
