@@ -31,3 +31,4 @@ remote-byok-models.diff
 server-web-build.diff
 editor-source-context.diff
 remote-edit-review.diff
+server-owned-byok.diff

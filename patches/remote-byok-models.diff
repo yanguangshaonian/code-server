@@ -191,12 +191,24 @@ Index: code-server/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandl
  	private readonly _relayRootConfigEnvelopes = new WeakMap<ActionEnvelope, ActionEnvelope>();
  	private readonly _telemetryReporter: AgentHostTelemetryReporter;
  	private readonly _managedSettingsOwnerId = generateUuid();
-@@ -2629,6 +2634,25 @@ export class ProtocolServerHandler exten
+@@ -2629,6 +2634,37 @@ export class ProtocolServerHandler exten
  		}
  
  		// VS Code extension methods (not in the typed protocol maps yet)
 +		if (method === 'extensions/byok/models' && this._config.byokLmBridgeRegistry && client.transport.relayClientId === undefined) {
-+			if (!Array.isArray(params) || params.length > 256 || !params.every(model => model && typeof model.vendor === 'string' && typeof model.id === 'string')) {
++			if (!Array.isArray(params) || params.length > 256 || !params.every(model => {
++				if (!model || typeof model.vendor !== 'string' || typeof model.id !== 'string') {
++					return false;
++				}
++				const direct = model.directProvider;
++				return direct === undefined || (direct !== null && typeof direct === 'object'
++					&& typeof direct.name === 'string' && direct.name.length > 0 && direct.name.length <= 16 * 1024
++					&& typeof direct.modelId === 'string' && direct.modelId.length > 0
++					&& (direct.type === 'openai' || direct.type === 'anthropic')
++					&& (direct.wireApi === undefined || direct.wireApi === 'responses' || direct.wireApi === 'completions')
++					&& typeof direct.baseUrl === 'string' && /^https?:\/\//.test(direct.baseUrl)
++					&& (direct.apiKey === undefined || typeof direct.apiKey === 'string'));
++			})) {
 +				client.transport.send(jsonRpcError(id, JsonRpcErrorCodes.InvalidParams, 'BYOK 模型列表无效.'));
 +				return;
 +			}

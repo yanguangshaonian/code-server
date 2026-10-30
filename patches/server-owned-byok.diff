@@ -1,0 +1,381 @@
+diff --git a/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts b/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
+index 4d0b2f5cf6b..c33f8acbb93 100644
+--- a/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
++++ b/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
+@@ -144,9 +144,17 @@ export interface IByokLmChatResult {
+ }
+ 
+ /**
+- * Metadata for a renderer BYOK model, enumerated over the bridge so the node
+- * agent host can advertise it to the SDK runtime without any host-side config.
++ * Ephemeral provider configuration used by the SDK for server-side inference.
+  */
++export interface IByokLmDirectProviderConfig {
++	readonly name: string;
++	readonly type: 'openai' | 'anthropic';
++	readonly wireApi?: 'completions' | 'responses';
++	readonly baseUrl: string;
++	readonly apiKey?: string;
++	readonly modelId: string;
++}
++
+ export interface IByokLmModelInfo {
+ 	/** Provider/vendor name (the LM API vendor that registered the model). */
+ 	readonly vendor: string;
+@@ -169,10 +177,12 @@ export interface IByokLmModelInfo {
+ 	readonly maxOutputTokens?: number;
+ 	/** Whether the model accepts image inputs, when known. */
+ 	readonly supportsVision?: boolean;
++	readonly supportsToolCalling?: boolean;
+ 	/** Reasoning effort values advertised by the renderer model, when known. */
+ 	readonly supportedReasoningEfforts?: readonly string[];
+ 	/** Default reasoning effort advertised by the renderer model, when known. */
+ 	readonly defaultReasoningEffort?: string;
++	readonly directProvider?: IByokLmDirectProviderConfig;
+ }
+ 
+ /**
+@@ -189,7 +199,9 @@ export function getByokLmSelectionModelId(model: IByokLmModelInfo): string {
+ 
+ /** Returns the provider-qualified model id advertised by the agent host. */
+ export function getByokLmAgentModelId(model: IByokLmModelInfo): string {
+-	return `${model.vendor}/${getByokLmSelectionModelId(model)}`;
++	return model.directProvider
++		? `${model.directProvider.name}/${model.directProvider.modelId}`
++		: `${model.vendor}/${getByokLmSelectionModelId(model)}`;
+ }
+ 
+ /**
+diff --git a/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts b/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts
+index d1a070ffd7f..93d1f1d7217 100644
+--- a/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts
++++ b/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts
+@@ -425,6 +425,9 @@ function stringifyAhpLogEntryTruncated(value: unknown, maxStringLength: number):
+  */
+ function _ahpReplacer(this: unknown, _key: string, value: unknown): unknown {
+ 	if (isRecord(value)) {
++		if (value.method === 'extensions/byok/models') {
++			return { ...value, params: '<redacted BYOK configuration>' };
++		}
+ 		if ((value.method === 'channel/frame' || value.method === 'tcp/data') && isRecord(value.params)) {
+ 			return { ...value, params: { ...value.params, data: '<redacted channel payload>' } };
+ 		}
+diff --git a/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts b/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts
+index d8797c1fce6..7fd04ff52ba 100644
+--- a/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts
++++ b/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts
+@@ -39,8 +39,8 @@ export interface IByokLmBridgeRegistry {
+ 	register(clientId: string, connection: IByokLmBridgeConnection): IDisposable;
+ 
+ 	/**
+-	 * The serving window's BYOK models, read synchronously from the cache (no
+-	 * enumeration). Use this for fast reads driven by {@link onDidChangeModels}.
++	 * Cached direct models plus the serving window's bridge-only models.
++	 * Direct models remain in process memory after the window disconnects.
+ 	 */
+ 	getModels(): readonly IByokLmModelInfo[];
+ 
+@@ -77,6 +77,7 @@ export class ByokLmBridgeRegistry implements IByokLmBridgeRegistry {
+ 
+ 	private readonly _entries = new Map<string, IConnectionEntry>();
+ 	private readonly _changeListeners = new Set<() => void>();
++	private _directModels: readonly IByokLmModelInfo[] = [];
+ 
+ 	onDidChangeModels(listener: () => void): IDisposable {
+ 		this._changeListeners.add(listener);
+@@ -109,6 +110,7 @@ export class ByokLmBridgeRegistry implements IByokLmBridgeRegistry {
+ 			}
+ 			if (entry.models === undefined || !modelsEqual(entry.models, models)) {
+ 				entry.models = models;
++				this._directModels = models.filter(model => model.directProvider !== undefined);
+ 				this._notifyChanged();
+ 			}
+ 		}));
+@@ -126,7 +128,8 @@ export class ByokLmBridgeRegistry implements IByokLmBridgeRegistry {
+ 	}
+ 
+ 	getModels(): readonly IByokLmModelInfo[] {
+-		return this._servingEntry()?.models ?? [];
++		const bridged = this._servingEntry()?.models ?? [];
++		return [...this._directModels, ...bridged.filter(model => !model.directProvider)];
+ 	}
+ 
+ 	getServingConnection(): IByokLmBridgeConnection | undefined {
+@@ -170,6 +173,8 @@ function modelsEqual(a: readonly IByokLmModelInfo[], b: readonly IByokLmModelInf
+ 			&& m.maxPromptTokens === n.maxPromptTokens
+ 			&& m.maxOutputTokens === n.maxOutputTokens
+ 			&& m.supportsVision === n.supportsVision
++			&& m.supportsToolCalling === n.supportsToolCalling
++			&& JSON.stringify(m.directProvider) === JSON.stringify(n.directProvider)
+ 			&& m.defaultReasoningEffort === n.defaultReasoningEffort
+ 			&& arraysEqual(m.supportedReasoningEfforts, n.supportedReasoningEfforts);
+ 	});
+diff --git a/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts b/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
+index 9767e3f365b..95dc1818b73 100644
+--- a/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
++++ b/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
+@@ -20,7 +20,7 @@ import { ILogService, LogLevel } from '../../../log/common/log.js';
+ import { ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
+ import { AgentSession, type IAgentModelInfo } from '../../common/agent.js';
+ import type { IAgentProviderSendStageRecorder } from '../../common/agentHostTelemetry.js';
+-import { getByokLmSelectionModelId, resolveByokLmEnablement, type IByokLmModelInfo } from '../../common/agentHostByokLm.js';
++import { getByokLmAgentModelId, getByokLmSelectionModelId, resolveByokLmEnablement, type IByokLmModelInfo } from '../../common/agentHostByokLm.js';
+ import { LOCAL_MODEL_SENTINEL_PROVIDER_NAME } from '../../common/localModel.js';
+ import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostByokModelsEnabledConfigKey, AgentHostCanvasesEnabledConfigKey, AgentHostMcpConnectorsEnabledConfigKey, AgentHostTelemetryLevelConfigKey, AgentHostWorkspaceTrustConfigKey, agentHostConfigValueToTelemetryLevel, platformRootSchema, type AgentHostMcpServers, type IAgentHostWorkspaceTrust } from '../../common/agentHostSchema.js';
+ import { isAgentHostWorkspaceTrusted } from '../../common/agentHostWorkspaceTrust.js';
+@@ -695,17 +695,8 @@ function toSdkCapiSessionOptions(autoTier: string | undefined): Pick<SessionConf
+ }
+ 
+ /**
+- * Resolve the BYOK provider/model session config for `sessionId` from the
+- * renderer's active bridge. Returns empty — the session launches without BYOK
+- * models — when BYOK is gated off (no active bridge), when the renderer reports
+- * no BYOK models, or when enumeration fails; `startProxy` is invoked only once
+- * at least one model is present.
+- *
+- * Each vendor maps to one `type: 'openai'` / `wireApi: 'responses'` provider
+- * whose `baseUrl` points at the proxy and authenticates with the session-scoped
+- * `Bearer <nonce>.<sessionId>`; each model is surfaced under the
+- * provider-qualified selection id `vendor/[group/]id`, matching what the renderer's
+- * `AgentHostByokLmHandler` resolves.
++ * Resolve cached BYOK models into SDK providers. Direct providers run on the
++ * server; only bridge-only models require a renderer and the loopback proxy.
+  *
+  * Extracted from {@link CopilotSessionLauncher} so the synthesis and gating are
+  * unit-testable without instantiating the launcher; the launcher passes a
+@@ -717,9 +708,6 @@ export async function synthesizeByokSessionConfig(
+ 	startProxy: () => Promise<IByokLmProxyHandle>,
+ 	logService: ILogService,
+ ): Promise<ICopilotByokSessionConfig> {
+-	// Surface the serving window's BYOK models. The registry does not union
+-	// windows' model sets — all serving windows expose the same set, so it picks
+-	// one (see `IByokLmBridgeRegistry`) and the proxy routes inference there.
+ 	let byokModels: IByokLmModelInfo[];
+ 	try {
+ 		byokModels = [...bridgeRegistry.getModels()];
+@@ -737,40 +725,52 @@ export async function synthesizeByokSessionConfig(
+ 	// selection ids ("Duplicate BYOK model selection id ...").
+ 	const seenSelectionIds = new Set<string>();
+ 	byokModels = byokModels.filter(m => {
+-		const selectionId = `${m.vendor}/${getByokLmSelectionModelId(m)}`;
++		const selectionId = getByokLmAgentModelId(m);
+ 		if (seenSelectionIds.has(selectionId)) {
+ 			return false;
+ 		}
+ 		seenSelectionIds.add(selectionId);
+ 		return true;
+ 	});
+-	// `startProxy` binds a local loopback listener — unlikely to fail, but it
+-	// must never break session materialization (which fires the cross-window
+-	// `sessionAdded` broadcast). Degrade to no BYOK config on failure.
+-	let handle: IByokLmProxyHandle;
+-	try {
+-		handle = await startProxy();
+-	} catch (err) {
+-		logService.warn(`[Copilot:${sessionId}] Failed to start BYOK loopback proxy`, err);
+-		return {};
++	const providers: NamedProviderConfig[] = [];
++	const directNames = new Set<string>();
++	for (const model of byokModels) {
++		const direct = model.directProvider;
++		if (direct && !directNames.has(direct.name)) {
++			directNames.add(direct.name);
++			providers.push({
++				name: direct.name, type: direct.type, baseUrl: direct.baseUrl,
++				...(direct.wireApi ? { wireApi: direct.wireApi } : {}),
++				...(direct.apiKey ? { apiKey: direct.apiKey } : {}),
++			});
++		}
++	}
++	const bridged = byokModels.filter(model => !model.directProvider);
++	if (bridged.length) {
++		try {
++			const handle = await startProxy();
++			for (const vendor of new Set(bridged.map(model => model.vendor))) {
++				providers.push({ name: vendor, type: 'openai', wireApi: 'responses', baseUrl: handle.providerBaseUrl(vendor), bearerToken: `${handle.nonce}.${sessionId}` });
++			}
++		} catch (err) {
++			logService.warn(`[Copilot:${sessionId}] 启动 BYOK 桥接代理失败.`, err);
++			byokModels = byokModels.filter(model => model.directProvider !== undefined);
++		}
+ 	}
+-	const providers: NamedProviderConfig[] = [...new Set(byokModels.map(m => m.vendor))].map(vendor => ({
+-		name: vendor,
+-		type: 'openai',
+-		wireApi: 'responses',
+-		baseUrl: handle.providerBaseUrl(vendor),
+-		bearerToken: `${handle.nonce}.${sessionId}`,
+-	}));
+ 	const models: ProviderModelConfig[] = byokModels.map(m => ({
+-		id: getByokLmSelectionModelId(m),
+-		provider: m.vendor,
++		id: m.directProvider?.modelId ?? getByokLmSelectionModelId(m),
++		provider: m.directProvider?.name ?? m.vendor,
+ 		...(m.name !== undefined ? { name: m.name } : {}),
+ 		...(m.maxContextWindowTokens !== undefined ? { maxContextWindowTokens: m.maxContextWindowTokens } : {}),
+ 		...(m.maxPromptTokens !== undefined ? { maxPromptTokens: m.maxPromptTokens } : {}),
+ 		...(m.maxOutputTokens !== undefined ? { maxOutputTokens: m.maxOutputTokens } : {}),
+-		// Without this the runtime treats the model as text-only and replaces
+-		// tool-result images (e.g. from the `view` tool) with a text receipt.
+-		...(m.supportsVision !== undefined ? { capabilities: { supports: { vision: m.supportsVision } } } : {}),
++		capabilities: {
++			supports: {
++				...(m.supportsVision !== undefined ? { vision: m.supportsVision } : {}),
++				...(m.supportsToolCalling !== undefined ? { toolCalls: m.supportsToolCalling } : {}),
++				...(m.supportedReasoningEfforts?.length ? { reasoningEffort: true } : {}),
++			}
++		},
+ 	}));
+ 	return { providers, models };
+ }
+@@ -1371,7 +1371,7 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
+ 		if (externalByok.models?.length) {
+ 			// The provider base URL carries the proxy's host:port, which correlates a
+ 			// session with its `ByokLmProxyService` bind when reading logs.
+-			this._logService.info(`[Copilot:${plan.sessionId}] Wired ${externalByok.models.length} BYOK model(s) across ${externalByok.providers?.length ?? 0} provider(s) via loopback proxy ${externalByok.providers?.[0]?.baseUrl}`);
++			this._logService.info(`[Copilot:${plan.sessionId}] 已配置 ${externalByok.models.length} 个 BYOK 模型, ${externalByok.providers?.length ?? 0} 个供应商.`);
+ 		}
+ 		// On-device direct-selection rows are added outside the BYOK gate.
+ 		const localModelConfig = plan.localModelProvider?.contributeSessionConfig();
+diff --git a/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts b/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
+index 4388a93a39e..916e8836906 100644
+--- a/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
++++ b/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
+@@ -6,7 +6,7 @@
+ import { CancellationToken } from '../../../../../../base/common/cancellation.js';
+ import { Emitter, Event } from '../../../../../../base/common/event.js';
+ import { Disposable } from '../../../../../../base/common/lifecycle.js';
+-import { decodeBase64, VSBuffer } from '../../../../../../base/common/buffer.js';
++import { decodeBase64, encodeBase64, VSBuffer } from '../../../../../../base/common/buffer.js';
+ import {
+ 	ByokLmImageMimeType,
+ 	getByokLmAgentModelId,
+@@ -16,6 +16,7 @@ import {
+ 	IByokLmContentPart,
+ 	IByokLmInputItem,
+ 	IByokLmModelInfo,
++	IByokLmDirectProviderConfig,
+ 	IByokLmOutputItem,
+ 	IByokLmReasoningItem,
+ } from '../../../../../../platform/agentHost/common/agentHostByokLm.js';
+@@ -39,6 +40,62 @@ const REASONING_METADATA_PREFIX = 'vscode-reasoning-metadata:';
+ const VSCODE_REASONING_SUMMARY_PART_DONE = 'vscode_reasoning_summary_part_done';
+ const CLIENT_BYOK_CONTEXT_KEYS = new Set([ChatEntitlementContextKeys.clientByokEnabled.key]);
+ 
++function asRecord(value: unknown): Record<string, unknown> | undefined {
++	return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
++}
++
++function toDirectProvider(vendor: string, identifier: string, modelId: string, configuration: Record<string, unknown>): IByokLmDirectProviderConfig | undefined {
++	const name = `vscode-byok-${vendor}-${encodeBase64(VSBuffer.fromString(identifier), false, true)}`;
++	const apiKey = typeof configuration.apiKey === 'string' ? configuration.apiKey : undefined;
++	if (name.length > 16 * 1024 || configuration.zeroDataRetentionEnabled === true
++		|| Object.keys(asRecord(configuration.requestHeaders) ?? {}).length || Object.keys(asRecord(configuration.modelOptions) ?? {}).length) {
++		return undefined;
++	}
++	const defaults: Record<string, { baseUrl: string; type: 'openai' | 'anthropic'; wireApi?: 'responses' | 'completions' }> = {
++		openai: { baseUrl: 'https://api.openai.com/v1', type: 'openai', wireApi: 'responses' },
++		openrouter: { baseUrl: 'https://openrouter.ai/api/v1', type: 'openai', wireApi: 'completions' },
++		xai: { baseUrl: 'https://api.x.ai/v1', type: 'openai', wireApi: 'completions' },
++		anthropic: { baseUrl: 'https://api.anthropic.com', type: 'anthropic' },
++	};
++	if (defaults[vendor]) {
++		return vendor === 'openrouter' && modelId.startsWith('anthropic/') ? undefined : { name, ...defaults[vendor], apiKey, modelId };
++	}
++	if (vendor === 'ollama') {
++		return typeof configuration.url === 'string'
++			? { name, type: 'openai', wireApi: 'completions', baseUrl: `${configuration.url.replace(/\/$/, '')}/v1`, apiKey, modelId }
++			: undefined;
++	}
++	if (vendor !== 'customendpoint' && vendor !== 'customoai') {
++		return undefined;
++	}
++	const model = Array.isArray(configuration.models) ? configuration.models.map(asRecord).find(entry => entry?.id === modelId) : undefined;
++	if (model && (Object.keys(asRecord(model.modelOptions) ?? {}).length || Object.keys(asRecord(model.requestHeaders) ?? {}).length
++		|| model.zeroDataRetentionEnabled === true || model.adaptiveThinking === true || model.thinking === true
++		|| (Array.isArray(model.editTools) && model.editTools.length) || typeof model.minThinkingBudget === 'number'
++		|| typeof model.maxThinkingBudget === 'number' || model.streaming === false || typeof model.reasoningEffortFormat === 'string')) {
++		return undefined;
++	}
++	const url = typeof model?.url === 'string' ? model.url : typeof configuration.url === 'string' ? configuration.url : undefined;
++	if (!url || url.includes('?') || url.includes('#')) {
++		return undefined;
++	}
++	const apiType = model?.apiType ?? configuration.apiType ?? (url.includes('/messages') ? 'messages' : url.includes('/responses') ? 'responses' : 'chat-completions');
++	if (apiType !== 'messages' && apiType !== 'responses' && apiType !== 'chat-completions') {
++		return undefined;
++	}
++	const suffix = apiType === 'chat-completions' ? '/chat/completions' : `/${apiType}`;
++	let baseUrl = url.replace(/\/$/, '');
++	if (['/messages', '/responses', '/chat/completions'].some(endpoint => baseUrl.endsWith(endpoint) && endpoint !== suffix)) {
++		return undefined;
++	}
++	if (baseUrl.endsWith(suffix)) {
++		baseUrl = baseUrl.slice(0, -suffix.length);
++	} else if (!/\/v\d+$/.test(baseUrl)) {
++		baseUrl += '/v1';
++	}
++	return { name, type: apiType === 'messages' ? 'anthropic' : 'openai', ...(apiType === 'messages' ? {} : { wireApi: apiType === 'responses' ? 'responses' : 'completions' }), baseUrl, apiKey, modelId };
++}
++
+ /**
+  * Renderer-side {@link IAgentHostByokLmHandler}. Services BYOK chat requests
+  * forwarded by the node agent host's OpenAI proxy by calling the VS Code LM
+@@ -169,6 +226,8 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
+ 			// Only genuine renderer BYOK models — exclude agent-host copies, which
+ 			// carry a `targetChatSessionType` and would otherwise re-enter the bridge.
+ 			if (metadata?.isBYOK && !metadata.targetChatSessionType) {
++				const resolvedProvider = await this._languageModelsService.getResolvedProviderConfiguration?.(identifier);
++				const directProvider = resolvedProvider ? toDirectProvider(metadata.vendor, identifier, metadata.id, resolvedProvider.configuration) : undefined;
+ 				const reasoningEffortSchema = metadata.configurationSchema?.properties?.reasoningEffort;
+ 				const supportedReasoningEfforts = reasoningEffortSchema?.enum?.filter((value): value is string => typeof value === 'string');
+ 				const defaultReasoningEffort = typeof reasoningEffortSchema?.default === 'string' ? reasoningEffortSchema.default : undefined;
+@@ -181,6 +240,8 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
+ 					maxPromptTokens: metadata.maxInputTokens,
+ 					maxOutputTokens: metadata.maxOutputTokens,
+ 					supportsVision: !!metadata.capabilities?.vision,
++					supportsToolCalling: metadata.capabilities?.toolCalling,
++					...(directProvider ? { directProvider } : {}),
+ 					...(supportedReasoningEfforts?.length ? { supportedReasoningEfforts } : {}),
+ 					...(defaultReasoningEffort !== undefined ? { defaultReasoningEffort } : {}),
+ 				};
+diff --git a/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts b/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts
+index c70e5e4896d..d4da47c0579 100644
+--- a/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts
++++ b/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts
+@@ -634,6 +634,11 @@ export interface ILanguageModelsGroup {
+ }
+ 
+ /** Read/write access to model-specific configuration, globally or within one conversation. */
++export interface ILanguageModelResolvedProviderConfiguration {
++	readonly name: string;
++	readonly configuration: IStringDictionary<unknown>;
++}
++
+ export interface IModelConfigurationAccess {
+ 	getModelConfiguration(modelId: string): IStringDictionary<unknown> | undefined;
+ 	/** Effective schema for this scope, including provider or managed startup defaults. */
+@@ -671,6 +676,7 @@ export interface ILanguageModelsService {
+ 	lookupLanguageModelByQualifiedName(qualifiedName: string): ILanguageModelChatMetadataAndIdentifier | undefined;
+ 
+ 	getLanguageModelGroups(vendor: string): ILanguageModelsGroup[];
++	getResolvedProviderConfiguration?(modelId: string): Promise<ILanguageModelResolvedProviderConfiguration | undefined>;
+ 
+ 	/**
+ 	 * Returns true if the given vendor's provider has completed at least one
+@@ -1647,6 +1653,15 @@ export class LanguageModelsService implements ILanguageModelsService {
+ 		return this._modelsGroups.get(vendor) ?? [];
+ 	}
+ 
++	async getResolvedProviderConfiguration(modelId: string): Promise<ILanguageModelResolvedProviderConfiguration | undefined> {
++		const metadata = this._modelCache.get(modelId);
++		const group = metadata && this._modelsGroups.get(metadata.vendor)?.find(candidate => candidate.modelIdentifiers.includes(modelId))?.group;
++		if (!metadata || !group) {
++			return undefined;
++		}
++		return { name: group.name, configuration: await this._resolveConfiguration(group, this._vendors.get(metadata.vendor)?.configuration) };
++	}
++
+ 	hasResolvedVendor(vendor: string): boolean {
+ 		return this._modelsGroups.has(vendor);
+ 	}
