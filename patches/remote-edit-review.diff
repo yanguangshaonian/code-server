@@ -1,0 +1,77 @@
+--- a/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostEditReview.ts
++++ b/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostEditReview.ts
+@@ -244,7 +244,7 @@
+ 	private readonly _rawChanges = derived<IAgentHostCheckpointReviewSource | undefined>(this, reader => {
+ 		const workingSet = this._workingSet.read(reader);
+ 		const state = workingSet?.state.read(reader);
+-		return workingSet ? { channel: workingSet.channel, ready: state?.status === ChangesetStatus.Ready, failed: workingSet.failed.read(reader) || state?.status === ChangesetStatus.Error, files: state ? toWorkingSetFileChanges(state, workingSet.connectionAuthority) : [] } : undefined;
++		return workingSet ? { channel: workingSet.channel, ready: state?.status === ChangesetStatus.Ready, failed: workingSet.failed.read(reader) || state?.status === ChangesetStatus.Error, files: state ? toWorkingSetFileChanges(state, workingSet.connectionAuthority, workingSet.connection) : [] } : undefined;
+ 	});
+ 	readonly fileChanges = derived(this, reader => {
+ 		const current = this._rawChanges.read(reader);
+@@ -326,7 +326,7 @@
+ 			retryBlockedFiles.read(reader);
+ 			const current = this._workingSet.read(reader);
+ 			const state = current?.state.read(reader);
+-			const rawFiles = current && state ? toWorkingSetFileChanges(state, current.connectionAuthority) : [];
++			const rawFiles = current && state ? toWorkingSetFileChanges(state, current.connectionAuthority, current.connection) : [];
+ 			const files = current ? this._checkpointReview.read(reader)?.project(current.channel, rawFiles, reader) ?? rawFiles : rawFiles;
+ 			for (const file of files) {
+ 				if (file.editing) {
+@@ -813,7 +813,7 @@
+ 	}
+ 
+ 	private _findWorkingSetFile(state: ChangesetState, workingSet: IWorkingSet, entry: AgentHostEditReviewEntry): IWorkingSetFileChange | undefined {
+-		return toWorkingSetFileChanges(state, workingSet.connectionAuthority)
++		return toWorkingSetFileChanges(state, workingSet.connectionAuthority, workingSet.connection)
+ 			.find(candidate => isEqual(this._uriIdentityService.asCanonicalUri(candidate.diff.modifiedURI), entry.modifiedURI));
+ 	}
+ 
+@@ -986,9 +986,19 @@
+ }
+ 
+ /** The files of a Working Set, with the version the host published for each. */
+-function toWorkingSetFileChanges(state: ChangesetState, connectionAuthority: string): IWorkingSetFileChange[] {
++function toWorkingSetFileChanges(state: ChangesetState, connectionAuthority: string, connection: IAgentConnection): IWorkingSetFileChange[] {
+ 	return state.files.map(file => {
+ 		const diff = agentHostChangesetFileToEntryDiff(file, connectionAuthority);
++		if (diff) {
++			const resource = connection.resourceUris.toAgentHost(diff.modifiedURI);
++			const mapped = connection.resourceUris.fromAgentHost(resource);
++			if (!isEqual(mapped, resource)) {
++				if (isEqual(diff.originalURI, diff.modifiedURI)) {
++					diff.originalURI = mapped;
++				}
++				diff.modifiedURI = mapped;
++			}
++		}
+ 		return diff && { diff, nonce: file.nonce, editing: file.isEditing === true };
+ 	}).filter(isDefined);
+ }
+--- a/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentHost/agentHostEditReview.test.ts
++++ b/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentHost/agentHostEditReview.test.ts
+@@ -633,3 +633,24 @@
++	test('maps ambient working-set files through the remote editor connection', async () => {
++		review.dispose();
++		const path = '/root/workspace/trade_gateway/账号信息汇总.txt';
++		const source = URI.file(path);
++		const remote = source.with({ scheme: Schemas.vscodeRemote, authority: 'test-host' });
++		host.resourceUris = {
++			fromAgentHost: resource => resource.scheme === Schemas.file ? resource.with({ scheme: Schemas.vscodeRemote, authority: 'test-host' }) : resource,
++			toAgentHost: resource => resource.scheme === Schemas.vscodeRemote ? resource.with({ scheme: Schemas.file, authority: '' }) : resource,
++		};
++		disk.set(remote, 'A\n');
++		host.setWorkingSet([workingSetFile(path, 'a\n', 'A\n')]);
++		review = createReview();
++		await waitForEntries(path);
++		const entry = review.getEntry(remote)!;
++		assert.ok(entry instanceof ChatEditingModifiedDocumentEntry);
++		await review.accept(remote);
++		assert.deepStrictEqual({ resource: entry.modifiedURI.toString(), target: host.invokedRequests[0].target?.resource, errors }, {
++			resource: remote.toString(), target: source.toString(), errors: [],
++		});
++	});
++
+ 	test('follows the Working Set as the agent host updates it', async () => {
+ 		hostWrites('/a.ts', 'one\nTWO\nthree\n');
+ 		hostWrites('/b.ts', 'B\n');

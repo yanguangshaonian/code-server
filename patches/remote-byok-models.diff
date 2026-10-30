@@ -1,3 +1,44 @@
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/common/chatSessionsService.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/common/chatSessionsService.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/common/chatSessionsService.ts
+@@ -467,10 +467,10 @@
+ /**
+  * Returns why models cannot be added for the given chat session type (harness), or `undefined` when they can.
+- * Added models are extension-provided BYOK models, which a remotely running Copilot agent host cannot reach:
+- * either a remote agent host session type, or the Copilot harness of a remote editor window.
++ * Independent remote Copilot agent hosts cannot reach extension-provided BYOK models.
++ * The Copilot harness of a remote editor window uses the editor's BYOK bridge.
+  */
+-export function getAddModelsUnavailableReason(sessionType: string | undefined, remoteAuthority: string | undefined): string | undefined {
+-	if (sessionType && isCopilotAgentHostSessionType(sessionType) && (isRemoteAgentHostSessionType(sessionType) || !!remoteAuthority)) {
++export function getAddModelsUnavailableReason(sessionType: string | undefined, _remoteAuthority: string | undefined): string | undefined {
++	if (sessionType && isCopilotAgentHostSessionType(sessionType) && isRemoteAgentHostSessionType(sessionType)) {
+ 		return localize('chat.addModels.remoteCopilotUnsupported', "BYOK models aren't supported in remote Copilot sessions");
+ 	}
+ 	return undefined;
+Index: code-server/lib/vscode/src/vs/workbench/contrib/chat/test/common/chatSessionsService.test.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/common/chatSessionsService.test.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/common/chatSessionsService.test.ts
+@@ -11,7 +11,7 @@
+ 
+ 	ensureNoDisposablesAreLeakedInTestSuite();
+ 
+-	test('only the remotely running Copilot agent-host harness cannot add models', () => {
++	test('only independent remote Copilot agent hosts cannot add models', () => {
+ 		const reason = (sessionType: string | undefined, remoteAuthority?: string) => getAddModelsUnavailableReason(sessionType, remoteAuthority) !== undefined;
+ 		assert.deepStrictEqual({
+ 			noHarness: reason(undefined, 'ssh-remote+host'),
+@@ -25,7 +25,7 @@
+ 			noHarness: false,
+ 			localHarnessInRemoteWindow: false,
+ 			copilotHarnessLocally: false,
+-			copilotHarnessInRemoteWindow: true,
++			copilotHarnessInRemoteWindow: false,
+ 			remoteAgentHostCopilotHarness: true,
+ 			remoteAgentHostClaudeHarness: false,
+ 			claudeHarnessInRemoteWindow: false,
 Index: code-server/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts
